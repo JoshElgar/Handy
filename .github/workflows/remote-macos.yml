@@ -1,0 +1,65 @@
+name: "Remote macOS build"
+
+on: workflow_dispatch
+
+jobs:
+  macos:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+          components: clippy
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Download VAD model
+        run: |
+          mkdir -p src-tauri/resources/models
+          curl -L --fail --show-error --retry 3 \
+            -o src-tauri/resources/models/silero_vad_v4.onnx \
+            https://blob.handy.computer/silero_vad_v4.onnx
+
+      - name: Check frontend lint and formatting
+        run: |
+          bun run lint
+          bun run format:check
+
+      - name: Run remote transcription Rust tests
+        working-directory: src-tauri
+        run: cargo test --lib remote_
+
+      - name: Run Rust Clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build Apple Silicon app
+        run: >-
+          bun run tauri build --target aarch64-apple-darwin --bundles app
+          --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Verify and zip app
+        run: |
+          set -euo pipefail
+          app="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Handy.app"
+          test -d "$app"
+          codesign --verify --deep --strict "$app"
+          codesign -dv --verbose=2 "$app" 2>&1 | grep -Fq 'Signature=adhoc'
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$app" Handy-macos-aarch64.zip
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Handy-macos-aarch64
+          path: Handy-macos-aarch64.zip
+          if-no-files-found: error
+          retention-days: 30
