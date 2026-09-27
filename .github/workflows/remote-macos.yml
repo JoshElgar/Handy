@@ -5,6 +5,9 @@ on: workflow_dispatch
 jobs:
   macos:
     runs-on: macos-26
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      TRANSCRIBE_CMAKE_ARGS: "-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0"
     steps:
       - uses: actions/checkout@v5
 
@@ -15,10 +18,7 @@ jobs:
           targets: aarch64-apple-darwin
           components: clippy
 
-      - uses: swatinem/rust-cache@v2
-        with:
-          workspaces: "./src-tauri -> target"
-
+      # Skip the Rust cache so a bundle built with the runner's default target cannot be restored.
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
@@ -55,9 +55,14 @@ jobs:
         run: |
           set -euo pipefail
           app="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Handy.app"
+          binary="$app/Contents/MacOS/handy"
           test -d "$app"
           codesign --verify --deep --strict "$app"
           codesign -dv --verbose=2 "$app" 2>&1 | grep -Fq 'Signature=adhoc'
+          platform="$(xcrun dyld_info -platform "$binary")"
+          printf '%s\n' "$platform"
+          grep -Eq 'macOS[[:space:]]+11\.0[[:space:]]' <<< "$platform"
+          xcrun dyld_info -imports "$binary" | grep -F '_OBJC_CLASS_$_MTLResidencySetDescriptor' || true
           ditto -c -k --sequesterRsrc --keepParent \
             "$app" Handy-macos-aarch64.zip
 
