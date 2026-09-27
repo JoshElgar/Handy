@@ -503,10 +503,15 @@ impl ShortcutAction for TranscribeAction {
         // Use the app-facing model capability as the single pre-recording source
         // for live streaming decisions. Unknown support is represented as false
         // until the model registry is updated by discovery or runtime load.
-        let model_supports_streaming = selected_model_info
-            .as_ref()
-            .map(|m| m.supports_streaming)
-            .unwrap_or(false);
+        let remote_transcription_enabled = settings
+            .remote_transcription_url
+            .as_deref()
+            .is_some_and(|url| !url.trim().is_empty());
+        let model_supports_streaming = remote_transcription_enabled
+            || selected_model_info
+                .as_ref()
+                .map(|m| m.supports_streaming)
+                .unwrap_or(false);
         let vad_policy = if !settings.vad_enabled {
             VadPolicy::Disabled
         } else if model_supports_streaming {
@@ -717,17 +722,25 @@ impl ShortcutAction for TranscribeAction {
                     // running, finalize it and use its text (all audio was already
                     // fed to the stream); otherwise batch-transcribe the samples.
                     let transcription_time = Instant::now();
-                    let transcription_result = match tm.finalize_stream() {
-                        // A finalized stream with usable text wins. An empty result
-                        // (no active stream, produced nothing, or a finalize error
-                        // after the engine was returned) falls back to a full batch
-                        // transcription of the same audio. A finalize timeout is
-                        // surfaced instead — the worker may still hold the engine,
-                        // so a batch fallback would contend with it.
-                        Ok(Some(text)) if !text.trim().is_empty() => Ok(text),
-                        Ok(_) => tm.transcribe(samples),
-                        Err(err) => Err(err),
-                    };
+                    let remote_stream = tm.is_remote_stream();
+                    let tm_for_transcription = Arc::clone(&tm);
+                    let transcription_result = tauri::async_runtime::spawn_blocking(move || {
+                        match tm_for_transcription.finalize_stream() {
+                            // A finalized stream with usable text wins. An empty result
+                            // (no active stream, produced nothing, or a finalize error
+                            // after the engine was returned) falls back to a full batch
+                            // transcription of the same audio. A finalize timeout is
+                            // surfaced instead — the worker may still hold the engine,
+                            // so a batch fallback would contend with it.
+                            Ok(Some(text)) if remote_stream || !text.trim().is_empty() => Ok(text),
+                            Ok(_) => tm_for_transcription.transcribe(samples),
+                            Err(err) => Err(err),
+                        }
+                    })
+                    .await
+                    .unwrap_or_else(|error| {
+                        Err(anyhow::anyhow!("Transcription task panicked: {error}"))
+                    });
 
                     // Await WAV save and verify
                     let wav_saved = match wav_handle.await {

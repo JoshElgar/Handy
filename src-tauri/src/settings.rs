@@ -325,7 +325,7 @@ pub enum VadBackend {
     Earshot,
 }
 
-#[derive(Clone, Serialize, Deserialize, Type)]
+#[derive(Clone, Default, Serialize, Deserialize, Type)]
 #[serde(transparent)]
 pub(crate) struct SecretMap(HashMap<String, String>);
 
@@ -451,6 +451,12 @@ pub struct AppSettings {
     pub post_process_providers: Vec<PostProcessProvider>,
     #[serde(default = "default_post_process_api_keys")]
     pub post_process_api_keys: SecretMap,
+    /// Optional HTTPS base URL for a self-hosted remote ASR service.
+    #[serde(default)]
+    pub remote_transcription_url: Option<String>,
+    /// API credentials for remote ASR (kept redacted in Debug output).
+    #[serde(default)]
+    pub remote_transcription_api_keys: SecretMap,
     #[serde(default = "default_post_process_models")]
     pub post_process_models: HashMap<String, String>,
     #[serde(default = "default_post_process_prompts")]
@@ -945,6 +951,8 @@ pub fn get_default_settings() -> AppSettings {
         post_process_provider_id: default_post_process_provider_id(),
         post_process_providers: default_post_process_providers(),
         post_process_api_keys: default_post_process_api_keys(),
+        remote_transcription_url: None,
+        remote_transcription_api_keys: SecretMap(HashMap::new()),
         post_process_models: default_post_process_models(),
         post_process_prompts: default_post_process_prompts(),
         post_process_selected_prompt_id: None,
@@ -1704,7 +1712,7 @@ mod tests {
     }
 
     #[test]
-    fn debug_output_redacts_api_keys() {
+    fn remote_transcription_secret_is_redacted_in_settings_debug() {
         let mut settings = get_default_settings();
         settings
             .post_process_api_keys
@@ -1716,11 +1724,15 @@ mod tests {
         settings
             .post_process_api_keys
             .insert("empty_provider".to_string(), "".to_string());
+        settings
+            .remote_transcription_api_keys
+            .insert("default".to_string(), "remote-asr-secret-token".to_string());
 
         let debug_output = format!("{:?}", settings);
 
         assert!(!debug_output.contains("sk-proj-secret-key-12345"));
         assert!(!debug_output.contains("sk-ant-secret-key-67890"));
+        assert!(!debug_output.contains("remote-asr-secret-token"));
         assert!(debug_output.contains("[REDACTED]"));
     }
 

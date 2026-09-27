@@ -34,6 +34,9 @@ jobs:
           bun run lint
           bun run format:check
 
+      - name: Build frontend for Rust tests
+        run: bun run build
+
       - name: Run remote transcription Rust tests
         working-directory: src-tauri
         run: cargo test --release --target aarch64-apple-darwin --locked --lib remote_

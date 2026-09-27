@@ -4,6 +4,7 @@ use crate::audio_toolkit::{
 };
 use crate::managers::audio::AudioRecordingManager;
 use crate::managers::model::{EngineType, ModelManager};
+use crate::remote_transcription::{RemoteCommand, RemoteTranscriptionConfig};
 use crate::settings::{
     get_settings, AppSettings, ModelUnloadTimeout, OrtAcceleratorSetting,
     TranscribeAcceleratorSetting,
@@ -122,6 +123,11 @@ pub struct StreamRouter {
     /// Command channel to the active streaming worker, present from
     /// `start_stream` until `finalize_stream`/`cancel_stream`.
     tx: Mutex<Option<mpsc::Sender<StreamCmd>>>,
+    remote_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<RemoteCommand>>>,
+    remote_cancel: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
+    remote_config: Mutex<Option<RemoteTranscriptionConfig>>,
+    remote_result: Mutex<Option<mpsc::Receiver<Result<Option<String>, String>>>>,
+    remote_failure: Mutex<Option<String>>,
     /// True while a stream is pending or active (channel is open). The audio
     /// callback checks this first to avoid the mutex lock when no stream runs.
     open: Arc<AtomicBool>,
@@ -131,8 +137,36 @@ impl StreamRouter {
     fn new() -> Self {
         Self {
             tx: Mutex::new(None),
+            remote_tx: Mutex::new(None),
+            remote_cancel: Mutex::new(None),
+            remote_config: Mutex::new(None),
+            remote_result: Mutex::new(None),
+            remote_failure: Mutex::new(None),
             open: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    fn open_remote(
+        &self,
+        config: Result<RemoteTranscriptionConfig, String>,
+    ) -> (
+        tokio::sync::mpsc::UnboundedReceiver<RemoteCommand>,
+        tokio::sync::watch::Receiver<bool>,
+        mpsc::Sender<Result<Option<String>, String>>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (cancel, cancel_rx) = tokio::sync::watch::channel(false);
+        let (result_tx, result_rx) = mpsc::channel();
+        self.clear_remote();
+        *self.remote_tx.lock().unwrap() = Some(tx);
+        *self.remote_cancel.lock().unwrap() = Some(cancel);
+        match config {
+            Ok(config) => *self.remote_config.lock().unwrap() = Some(config),
+            Err(error) => *self.remote_failure.lock().unwrap() = Some(error),
+        }
+        *self.remote_result.lock().unwrap() = Some(result_rx);
+        self.open.store(true, Ordering::Relaxed);
+        (rx, cancel_rx, result_tx)
     }
 
     /// Open a fresh command channel for a new streaming session, returning the
@@ -159,6 +193,37 @@ impl StreamRouter {
         *self.tx.lock().unwrap() = None;
     }
 
+    fn is_remote(&self) -> bool {
+        self.remote_config.lock().unwrap().is_some()
+            || self.remote_tx.lock().unwrap().is_some()
+            || self.remote_failure.lock().unwrap().is_some()
+    }
+
+    fn finish_remote(
+        &self,
+    ) -> Option<(
+        tokio::sync::mpsc::UnboundedSender<RemoteCommand>,
+        mpsc::Receiver<Result<Option<String>, String>>,
+    )> {
+        self.open.store(false, Ordering::Relaxed);
+        let tx = self.remote_tx.lock().unwrap().take()?;
+        let result = self.remote_result.lock().unwrap().take()?;
+        Some((tx, result))
+    }
+
+    fn remote_failure(&self) -> Option<String> {
+        self.remote_failure.lock().unwrap().clone()
+    }
+
+    fn clear_remote(&self) {
+        self.open.store(false, Ordering::Relaxed);
+        self.remote_tx.lock().unwrap().take();
+        self.remote_cancel.lock().unwrap().take();
+        self.remote_config.lock().unwrap().take();
+        self.remote_result.lock().unwrap().take();
+        self.remote_failure.lock().unwrap().take();
+    }
+
     /// Forward a 16 kHz frame to the active streaming worker. Cheap no-op (a
     /// single relaxed atomic load) when no stream is pending.
     pub fn feed(&self, frame: &[f32]) {
@@ -167,6 +232,11 @@ impl StreamRouter {
         }
         if let Some(tx) = self.tx.lock().unwrap().as_ref() {
             let _ = tx.send(StreamCmd::Feed(frame.to_vec()));
+        }
+        if let Some(tx) = self.remote_tx.lock().unwrap().as_ref() {
+            // ponytail: Unbounded so backlog never drops accepted audio; memory grows while the
+            // server lags. Add disk spooling only if long recordings justify it.
+            let _ = tx.send(RemoteCommand::Audio(frame.to_vec()));
         }
     }
 
@@ -482,6 +552,21 @@ impl TranscriptionManager {
         model_id: &str,
         device_index: Option<usize>,
     ) -> Result<()> {
+        match RemoteTranscriptionConfig::from_settings(&get_settings(&self.app_handle)) {
+            Ok(Some(_)) => {
+                let mut engine = self.lock_engine();
+                *engine = None;
+                *self.current_model_id.lock().unwrap() = None;
+                return Ok(());
+            }
+            Err(error) => {
+                let mut engine = self.lock_engine();
+                *engine = None;
+                *self.current_model_id.lock().unwrap() = None;
+                return Err(error);
+            }
+            Ok(None) => {}
+        }
         apply_accelerator_settings(&self.app_handle);
 
         let load_start = std::time::Instant::now();
@@ -742,6 +827,17 @@ impl TranscriptionManager {
 
     /// Kicks off the model loading in a background thread if it's not already loaded
     pub fn initiate_model_load(&self) {
+        let settings = get_settings(&self.app_handle);
+        if settings
+            .remote_transcription_url
+            .as_deref()
+            .is_some_and(|url| !url.trim().is_empty())
+        {
+            let mut engine = self.lock_engine();
+            *engine = None;
+            *self.current_model_id.lock().unwrap() = None;
+            return;
+        }
         let mut is_loading = self.is_loading.lock().unwrap();
         if *is_loading {
             return;
@@ -760,8 +856,8 @@ impl TranscriptionManager {
                     .reload_model_on_next_use
                     .store(false, Ordering::Release);
             }
-            let settings = get_settings(&self_clone.app_handle);
-            if let Err(e) = self_clone.load_model(&settings.selected_model) {
+            let selected_model = get_settings(&self_clone.app_handle).selected_model;
+            if let Err(e) = self_clone.load_model(&selected_model) {
                 error!("Failed to load model: {}", e);
             }
             let mut is_loading = self_clone.is_loading.lock().unwrap();
@@ -795,6 +891,11 @@ impl TranscriptionManager {
         self.stream_active.load(Ordering::Acquire)
     }
 
+    /// Whether the current recording is routed to the configured remote service.
+    pub fn is_remote_stream(&self) -> bool {
+        self.router.is_remote()
+    }
+
     /// Shared handle to the stream router, used by the audio recorder to feed
     /// real-time frames without going through Tauri state on every frame.
     pub fn stream_router(&self) -> Arc<StreamRouter> {
@@ -823,6 +924,49 @@ impl TranscriptionManager {
             .is_err()
         {
             warn!("start_stream lost a race with another stream worker");
+            return;
+        }
+        let settings = get_settings(&self.app_handle);
+        if settings
+            .remote_transcription_url
+            .as_deref()
+            .is_some_and(|url| !url.trim().is_empty())
+        {
+            let config = RemoteTranscriptionConfig::from_settings(&settings)
+                .map_err(|error| error.to_string())
+                .and_then(|config| config.ok_or_else(|| "Remote ASR URL is empty".to_string()));
+            let (commands, cancel, result_tx) = self.router.open_remote(config.clone());
+            self.stream_active.store(true, Ordering::Release);
+            let manager = self.clone();
+            let app_handle = self.app_handle.clone();
+            thread::spawn(move || {
+                let worker = StreamWorkerGuard {
+                    worker_id,
+                    active_stream_worker: Arc::clone(&manager.active_stream_worker),
+                    active_engine_lease: Arc::clone(&manager.active_engine_lease),
+                    stream_active: Arc::clone(&manager.stream_active),
+                };
+                let result = match config {
+                    Ok(config) => {
+                        tauri::async_runtime::block_on(crate::remote_transcription::stream(
+                            &config,
+                            commands,
+                            cancel,
+                            move |committed, tentative| {
+                                let _ = StreamTextEvent {
+                                    committed,
+                                    tentative,
+                                }
+                                .emit(&app_handle);
+                            },
+                        ))
+                        .map_err(|error| error.to_string())
+                    }
+                    Err(error) => Err(error),
+                };
+                drop(worker);
+                let _ = result_tx.send(result);
+            });
             return;
         }
         let rx = self.router.open();
@@ -1113,6 +1257,39 @@ impl TranscriptionManager {
     /// A timeout may still leave the worker holding the engine, so callers
     /// should surface it instead of immediately starting a batch fallback.
     pub fn finalize_stream(&self) -> Result<Option<String>> {
+        if self.router.is_remote() {
+            let Some((tx, result_rx)) = self.router.finish_remote() else {
+                let failure = self.router.remote_failure();
+                self.router.clear_remote();
+                return Err(anyhow::anyhow!(failure.unwrap_or_else(|| {
+                    "Remote transcription stream ended without a result channel".into()
+                })));
+            };
+            let _ = tx.send(RemoteCommand::Finish);
+            let mut result = result_rx
+                .recv()
+                .map_err(|_| anyhow::anyhow!("Remote transcription stream exited without a result"))
+                .and_then(|result| result.map_err(|error| anyhow::anyhow!(error)))
+                .and_then(|text| {
+                    text.ok_or_else(|| anyhow::anyhow!("Remote transcription stream was cancelled"))
+                });
+            if result.is_err() {
+                if let Some(failure) = self.router.remote_failure() {
+                    result = Err(anyhow::anyhow!(failure));
+                }
+            }
+            self.router.clear_remote();
+            let text = result?;
+            let settings = get_settings(&self.app_handle);
+            let evidence = OutputLanguageEvidence::ModelConstrained("en".to_string());
+            return Ok(Some(post_process_transcription_text(
+                text,
+                &settings,
+                false,
+                &evidence,
+                &["en".to_string()],
+            )));
+        }
         let Some(tx) = self.router.take() else {
             return Ok(None);
         };
@@ -1150,6 +1327,10 @@ impl TranscriptionManager {
 
     /// Abandon any active stream without producing text (e.g. on cancel).
     pub fn cancel_stream(&self) {
+        if let Some(cancel) = self.router.remote_cancel.lock().unwrap().take() {
+            let _ = cancel.send(true);
+        }
+        self.router.clear_remote();
         if let Some(tx) = self.router.take() {
             let _ = tx.send(StreamCmd::Cancel);
         }
@@ -1193,6 +1374,33 @@ impl TranscriptionManager {
             debug!("Empty audio vector");
             self.maybe_unload_immediately("empty audio");
             return Ok(String::new());
+        }
+
+        // History retries and non-streaming requests use the same configured
+        // endpoint, without loading or requiring the selected local model.
+        let remote_settings = get_settings(&self.app_handle);
+        match RemoteTranscriptionConfig::from_settings(&remote_settings) {
+            Ok(Some(config)) => {
+                let remote_audio = audio;
+                let text = thread::spawn(move || {
+                    tauri::async_runtime::block_on(crate::remote_transcription::transcribe(
+                        &config,
+                        &remote_audio,
+                    ))
+                })
+                .join()
+                .map_err(|_| anyhow::anyhow!("Remote transcription task panicked"))??;
+                let evidence = OutputLanguageEvidence::ModelConstrained("en".to_string());
+                return Ok(post_process_transcription_text(
+                    text,
+                    &remote_settings,
+                    false,
+                    &evidence,
+                    &["en".to_string()],
+                ));
+            }
+            Err(error) => return Err(error),
+            Ok(None) => {}
         }
 
         // Check if model is loaded, if not try to load it
