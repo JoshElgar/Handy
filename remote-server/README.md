@@ -20,11 +20,28 @@ Connect to wss://HOST/stream with Authorization: Bearer TOKEN.
 3. Send binary little-endian float32 mono audio frames. Each frame must be 4-byte aligned and at most 64 KiB. The server processes frames in order; clients may send ahead while draining progress and partial messages concurrently.
 4. After sending every frame, send {"type":"finish"}. The server drains all accepted audio, finalizes the model stream, emits {"type":"final","text":"..."}, then closes normally. Final text is the native stream's full hypothesis, including any tentative tail.
 
-Each audio chunk gets a partial message with committed and tentative text. A malformed frame or protocol message produces an error and closes the stream. An occupied server emits {"type":"error","message":"busy"} then closes with code 1013. Disconnecting abandons the stream; the model is reusable after any native call already in progress has returned.
+Each audio chunk gets a partial message with committed and tentative text. A malformed frame or protocol message produces an error and closes the stream. An occupied server emits {"type":"error","message":"busy"} then closes with code 1013. Disconnecting abandons the stream; the model is reusable after any native call already in progress has returned. Slow audio backlogs do not hit a WebSocket ping deadline; the client inactivity deadline still applies.
 
 ## History retry
 
 For a complete recording, send POST /transcribe with Authorization: Bearer TOKEN, Content-Type: audio/wav, and a WAV body containing 16 kHz mono PCM16. The endpoint accepts files up to 128 MiB (about 70 minutes of raw PCM16; Handy history retries are expected to be shorter) and uses the same streaming decoder, feeding one-second chunks before finalizing. Success returns {"text":"..."}. Busy responses use HTTP 503 and Retry-After: 2.
+
+## Configure the Handy fork
+
+Quit Handy, then edit `~/Library/Application Support/com.pais.handy/settings_store.json`. Keep the other settings and add these keys inside its existing `settings` object:
+
+```json
+"remote_transcription_url": "https://YOUR_SERVICE.onrender.com",
+"remote_transcription_api_keys": {
+  "default": "YOUR_API_TOKEN"
+}
+```
+
+Use the HTTPS service origin without a path, query, or fragment. The client uses the `default` token for both streaming and history retry. Store the file with user-only permissions and never share the token. Set `remote_transcription_url` to `null` or remove it to return to local transcription.
+
+When a remote URL is configured, Handy skips loading its local speech model and reuses the existing live transcription overlay. The service uses the English Parakeet Unified model. Failed live requests keep the recorded audio in History so it can be retried. Audio waiting in the in-process remote queue uses local memory that grows with backlog; short streams are small, but avoid leaving a long queue accumulating.
+
+After changing settings, reopen Handy. A fresh build from the fork is required; stock Handy does not use these settings.
 
 ## Checks
 

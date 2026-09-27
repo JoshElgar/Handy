@@ -36,11 +36,11 @@ jobs:
 
       - name: Run remote transcription Rust tests
         working-directory: src-tauri
-        run: cargo test --lib remote_
+        run: cargo test --release --target aarch64-apple-darwin --locked --lib remote_
 
       - name: Run Rust Clippy
         working-directory: src-tauri
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --release --target aarch64-apple-darwin --locked --all-targets -- -D warnings
 
       - name: Build Apple Silicon app
         run: >-
