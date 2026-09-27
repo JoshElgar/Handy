@@ -107,6 +107,13 @@ enum StreamCmd {
     Cancel,
 }
 
+type RemoteStreamResult = Result<Option<String>, String>;
+type RemoteStreamResultReceiver = mpsc::Receiver<RemoteStreamResult>;
+type RemoteStreamFinish = (
+    tokio::sync::mpsc::UnboundedSender<RemoteCommand>,
+    RemoteStreamResultReceiver,
+);
+
 struct FinalizedStreamText {
     text: String,
     output_language: OutputLanguageEvidence,
@@ -126,7 +133,7 @@ pub struct StreamRouter {
     remote_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<RemoteCommand>>>,
     remote_cancel: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
     remote_config: Mutex<Option<RemoteTranscriptionConfig>>,
-    remote_result: Mutex<Option<mpsc::Receiver<Result<Option<String>, String>>>>,
+    remote_result: Mutex<Option<RemoteStreamResultReceiver>>,
     remote_failure: Mutex<Option<String>>,
     /// True while a stream is pending or active (channel is open). The audio
     /// callback checks this first to avoid the mutex lock when no stream runs.
@@ -152,7 +159,7 @@ impl StreamRouter {
     ) -> (
         tokio::sync::mpsc::UnboundedReceiver<RemoteCommand>,
         tokio::sync::watch::Receiver<bool>,
-        mpsc::Sender<Result<Option<String>, String>>,
+        mpsc::Sender<RemoteStreamResult>,
     ) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let (cancel, cancel_rx) = tokio::sync::watch::channel(false);
@@ -199,12 +206,7 @@ impl StreamRouter {
             || self.remote_failure.lock().unwrap().is_some()
     }
 
-    fn finish_remote(
-        &self,
-    ) -> Option<(
-        tokio::sync::mpsc::UnboundedSender<RemoteCommand>,
-        mpsc::Receiver<Result<Option<String>, String>>,
-    )> {
+    fn finish_remote(&self) -> Option<RemoteStreamFinish> {
         self.open.store(false, Ordering::Relaxed);
         let tx = self.remote_tx.lock().unwrap().take()?;
         let result = self.remote_result.lock().unwrap().take()?;

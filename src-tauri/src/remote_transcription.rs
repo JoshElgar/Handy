@@ -348,8 +348,11 @@ mod tests {
                         assert!(bytes.len() <= MAX_AUDIO_FRAME_BYTES);
                         samples.extend(
                             bytes
-                                .chunks_exact(4)
-                                .map(|b| f32::from_le_bytes(b.try_into().unwrap())),
+                                .as_ref()
+                                .as_chunks::<4>()
+                                .0
+                                .iter()
+                                .map(|bytes| f32::from_le_bytes(*bytes)),
                         );
                     }
                     Message::Text(text) if text.contains("finish") => {
