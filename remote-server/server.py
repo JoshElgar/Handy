@@ -132,7 +132,7 @@ def create_app(*, model=None, token=None):
                 decoder = None
                 try:
                     model_value = await _native_call(get_or_load_model)
-                    session = await _native_call(lambda: model_value.session(n_threads=1))
+                    session = await _native_call(lambda: model_value.session(n_threads=2))
                     decoder = await _native_call(session.stream)
                     remaining = frames
                     while remaining:
@@ -202,7 +202,7 @@ def create_app(*, model=None, token=None):
                     await websocket.send_json({"type": "error", "message": "invalid start message"})
                 return
             model_value = await _native_call(get_or_load_model)
-            session = await _native_call(lambda: model_value.session(n_threads=1))
+            session = await _native_call(lambda: model_value.session(n_threads=2))
             decoder = await _native_call(session.stream)
             async with websocket.state.send_lock:
                 await websocket.send_json({"type": "ready"})
