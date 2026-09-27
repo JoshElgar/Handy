@@ -54,9 +54,13 @@ jobs:
       - name: Verify and zip app
         run: |
           set -euo pipefail
-          app="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Handy.app"
+          app="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Handy Remote.app"
           binary="$app/Contents/MacOS/handy"
           test -d "$app"
+          bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")"
+          bundle_name="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$app/Contents/Info.plist")"
+          test "$bundle_id" = "com.joshelgar.handy.remote"
+          test "$bundle_name" = "Handy Remote"
           codesign --verify --deep --strict "$app"
           codesign -dv --verbose=2 "$app" 2>&1 | grep -Fq 'Signature=adhoc'
           platform="$(xcrun dyld_info -platform "$binary")"
@@ -64,11 +68,11 @@ jobs:
           grep -Eq 'macOS[[:space:]]+11\.0[[:space:]]' <<< "$platform"
           xcrun dyld_info -imports "$binary" | grep -F '_OBJC_CLASS_$_MTLResidencySetDescriptor' || true
           ditto -c -k --sequesterRsrc --keepParent \
-            "$app" Handy-macos-aarch64.zip
+            "$app" Handy-Remote-macos-aarch64.zip
 
       - uses: actions/upload-artifact@v7
         with:
-          name: Handy-macos-aarch64
-          path: Handy-macos-aarch64.zip
+          name: Handy-Remote-macos-aarch64
+          path: Handy-Remote-macos-aarch64.zip
           if-no-files-found: error
           retention-days: 30

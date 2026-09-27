@@ -28,7 +28,7 @@ For a complete recording, send POST /transcribe with Authorization: Bearer TOKEN
 
 ## Configure the Handy fork
 
-Quit Handy, then edit `~/Library/Application Support/com.pais.handy/settings_store.json`. Keep the other settings and add these keys inside its existing `settings` object:
+Quit Handy Remote, then edit `~/Library/Application Support/com.joshelgar.handy.remote/settings_store.json`. Keep the other settings and add these keys inside its existing `settings` object:
 
 ```json
 "remote_transcription_url": "https://YOUR_SERVICE.onrender.com",
@@ -41,7 +41,7 @@ Use the HTTPS service origin without a path, query, or fragment. The client uses
 
 When a remote URL is configured, Handy skips loading its local speech model and reuses the existing live transcription overlay. The service uses the English Parakeet Unified model. Failed live requests keep the recorded audio in History so it can be retried. Audio waiting in the in-process remote queue uses local memory that grows with backlog; short streams are small, but avoid leaving a long queue accumulating.
 
-After changing settings, reopen Handy. A fresh build from the fork is required; stock Handy does not use these settings.
+After changing settings, reopen Handy Remote. A fresh build from the fork is required; stock Handy does not use these settings. The fork stores settings and History separately; remote transcription does not load the local speech model. Since macOS treats Handy Remote as a separate app, grant it fresh Accessibility and microphone permissions on first use. The original Handy app may remain installed, but avoid enabling autostart in both apps because they share global keyboard shortcuts.
 
 ## Checks
 
