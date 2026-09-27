@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
     MODEL_PATH=/app/models/parakeet-unified-en-0.6b-Q8_0.gguf \
-    TRANSCRIBE_LIBRARY=/opt/transcribe-build/src/libtranscribe.so \
+    TRANSCRIBE_LIBRARY=/opt/transcribe/lib/libtranscribe.so \
     PYTHONPATH=/opt/transcribe.cpp/bindings/python/src \
     PORT=10000
 
@@ -25,12 +25,17 @@ RUN git init \
       -DTRANSCRIBE_VULKAN=OFF \
       -DTRANSCRIBE_CUDA=OFF \
       -DTRANSCRIBE_HIP=OFF \
+      -DTRANSCRIBE_GGML_BACKEND_DL=ON \
+      -DGGML_CPU_ALL_VARIANTS=ON \
       -DTRANSCRIBE_X86_CONSERVATIVE=ON \
-    && cmake --build /opt/transcribe-build --target transcribe -j2
+      -DCMAKE_INSTALL_PREFIX=/opt/transcribe \
+      -DCMAKE_INSTALL_LIBDIR=lib \
+    && cmake --build /opt/transcribe-build --target transcribe -j2 \
+    && cmake --install /opt/transcribe-build
 
 RUN python -m pip install --no-cache-dir \
       'fastapi==0.115.12' 'uvicorn[standard]==0.34.0' 'httpx==0.28.1' \
-    && python -c 'import transcribe_cpp' \
+    && python -c 'import transcribe_cpp; assert transcribe_cpp.backend_available("cpu"), transcribe_cpp.backends()' \
     && mkdir -p /app/models \
     && curl -fL --retry 3 \
       'https://huggingface.co/handy-computer/parakeet-unified-en-0.6b-gguf/resolve/main/parakeet-unified-en-0.6b-Q8_0.gguf' \
@@ -38,7 +43,7 @@ RUN python -m pip install --no-cache-dir \
 
 WORKDIR /app
 COPY server.py test_server.py ./
-RUN API_TOKEN=test-secret python -c 'import transcribe_cpp' \
+RUN API_TOKEN=test-secret python -c 'import transcribe_cpp; assert transcribe_cpp.backend_available("cpu"), transcribe_cpp.backends()' \
     && python -m unittest -v test_server
 
 EXPOSE 10000

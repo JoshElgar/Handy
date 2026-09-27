@@ -2,6 +2,8 @@
 
 This single-process CPU server uses Handy's transcribe-cpp 0.2.4 binding and the Q8_0 model handy-computer/parakeet-unified-en-0.6b-gguf. The image builds the native library from pinned commit 4807edaf210d0d7e8a6f7fb2a44b65966a2797f0 and downloads the 731 MB model. It loads one model lazily and permits one transcription at a time.
 
+The CPU backend is built as portable ISA-specific modules and selects the best supported variant at runtime. The x64 baseline remains available for older hosts.
+
 ## Build and run
 
 ```sh
