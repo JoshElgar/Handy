@@ -1,6 +1,6 @@
 # Handy remote Parakeet server
 
-This single-process CPU server uses Handy's transcribe-cpp 0.2.4 binding and the Q8_0 model handy-computer/parakeet-unified-en-0.6b-gguf. The image builds the native library from pinned commit 4807edaf210d0d7e8a6f7fb2a44b65966a2797f0 and downloads the 731 MB model. It loads one model lazily and permits one transcription at a time, using two inference threads on the two-CPU Render instance.
+This CPU server with one persistent model subprocess uses Handy's transcribe-cpp 0.2.4 binding and the Q8_0 model handy-computer/parakeet-unified-en-0.6b-gguf. The image builds the native library from pinned commit 4807edaf210d0d7e8a6f7fb2a44b65966a2797f0 and downloads the 731 MB model. It loads one model lazily and processes the newest transcription, using two inference threads on the two-CPU Render instance.
 
 The CPU backend is built as portable ISA-specific modules and selects the best supported variant at runtime. The x64 baseline remains available for older hosts.
 
@@ -22,15 +22,15 @@ Connect to wss://HOST/stream with Authorization: Bearer TOKEN.
 3. Send binary little-endian float32 mono audio frames. Each frame must be 4-byte aligned and at most 64 KiB. The server processes frames in order; clients may send ahead while draining progress and partial messages concurrently.
 4. After sending every frame, send {"type":"finish"}. The server drains all accepted audio, finalizes the model stream, emits {"type":"final","text":"..."}, then closes normally. Final text is the native stream's full hypothesis, including any tentative tail.
 
-Each audio chunk gets a partial message with committed and tentative text. A malformed frame or protocol message produces an error and closes the stream. An occupied server emits {"type":"error","message":"busy"} then closes with code 1013. For Cancel, send {"type":"cancel"} and close the socket. The server acknowledges {"type":"cancelled"}, discards queued audio, and notices disconnects even during inference. The model becomes reusable after the active native call returns; its memory is never freed underneath an active call. Cancellation acknowledgement confirms receipt, not that inference has already stopped.
+Each audio chunk gets a partial message with committed and tentative text. A malformed frame or protocol message produces an error and closes the stream. A valid new start replaces unfinished work globally (this deployment is for one user). The server kills and reaps the old model process, discards its audio and returns {"type":"error","message":"replaced by a newer recording"} to the old stream. The new stream starts a fresh model. Successful recordings reuse the loaded process. For Cancel, send {"type":"cancel"} and close the socket. The server acknowledges {"type":"cancelled"}, discards queued audio, and notices disconnects even during inference. Cancel or disconnect kills unfinished model work, even if inference is hung. Cancellation is acknowledged after process termination.
 
 The server checks WebSocket ping/pong every 20 seconds with a 20-second response deadline. The client continues answering while waiting for the final transcript. These checks detect a dead connection, not slow transcription. Received audio is limited to a 128 MiB backlog or 8192 queued messages; exceeding either closes the stream with an explicit error. Ordinary Finish still drains every accepted frame in order.
 
-Logs identify each stream and record cancellation/disconnect, the active phase, native-call start and return times, received/processed sample counts, and slot release. A native call start followed by cancellation without a matching return identifies an outstanding model call; it does not by itself prove that the call is permanently hung.
+Logs identify model process starts/stops and command start/return times. The subprocess uses a private stdin/stdout protocol; native diagnostics go to stderr. No additional service or dependency is needed.
 
 ## History retry
 
-For a complete recording, send POST /transcribe with Authorization: Bearer TOKEN, Content-Type: audio/wav, and a WAV body containing 16 kHz mono PCM16. The endpoint accepts files up to 128 MiB (about 70 minutes of raw PCM16; Handy history retries are expected to be shorter) and uses the same streaming decoder, feeding one-second chunks before finalizing. Success returns {"text":"..."}. Busy responses use HTTP 503 and Retry-After: 2.
+For a complete recording, send POST /transcribe with Authorization: Bearer TOKEN, Content-Type: audio/wav, and a WAV body containing 16 kHz mono PCM16. The endpoint accepts files up to 128 MiB (about 70 minutes of raw PCM16; Handy history retries are expected to be shorter) and uses the same streaming decoder, feeding one-second chunks before finalizing. Success returns {"text":"..."}. History requests share the newest-request policy: a newer request replaces unfinished work, and a replaced history request receives HTTP 409.
 
 ## Configure the Handy fork
 
@@ -57,4 +57,4 @@ The image build runs the fake-native protocol tests before it downloads as a run
 API_TOKEN=test-secret python -m unittest -v test_server
 ```
 
-The tests cover auth, WebSocket protocol and audio validation, ordered complete frame delivery, final drain, periodic progress during native finalize, busy handling, failure/disconnect cleanup, and retry with audio longer than one minute. They use synthetic audio and a fake inference session.
+The tests cover auth, WebSocket protocol and audio validation, ordered complete frame delivery, final drain, periodic progress during native finalize, replacement of a hung process, successful process reuse, cancellation/disconnect, crash recovery, history retry and validation. They use synthetic audio and a real subprocess with a fake model protocol.

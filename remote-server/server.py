@@ -7,7 +7,8 @@ import math
 import os
 import sys
 import tempfile
-import threading
+import base64
+from pathlib import Path
 import time
 import wave
 from contextlib import asynccontextmanager
@@ -15,7 +16,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
-MODEL_PATH = os.environ.get("MODEL_PATH", "/app/models/parakeet-unified-en-0.6b-Q8_0.gguf")
+MODEL_PATH = os.environ.get(
+    "MODEL_PATH", "/app/models/parakeet-unified-en-0.6b-Q8_0.gguf"
+)
 MAX_FRAME_BYTES = 64 * 1024
 MAX_WAV_BYTES = 128 * 1024 * 1024
 PROGRESS_INTERVAL = 10
@@ -64,40 +67,94 @@ async def _progress(websocket, stop):
                 return
 
 
-async def _native_call(function):
-    work = asyncio.create_task(asyncio.to_thread(function))
-    try:
-        return await asyncio.shield(work)
-    except asyncio.CancelledError:
-        try:
-            await work
-        finally:
-            raise
-
-
-def _is_cancel(text):
-    try:
-        return json.loads(text) == {"type": "cancel"}
-    except (ValueError, TypeError):
-        return False
-
-
-def create_app(*, model=None, token=None):
+def create_app(*, token=None, worker_command=None):
     token = token if token is not None else _token_from_environment()
-    state = {"model": model, "active": threading.Lock()}
+    worker_command = worker_command or [
+        sys.executable,
+        "-u",
+        str(Path(__file__).with_name("model_worker.py")),
+    ]
+    state = {"worker": None, "active": None}
+    lock = asyncio.Lock()
 
-    def get_or_load_model():
-        if state["model"] is None:
-            import transcribe_cpp
+    async def kill_worker():
+        worker = state["worker"]
+        state["worker"] = None
+        if worker is not None:
+            if worker.returncode is None:
+                try:
+                    worker.kill()
+                except ProcessLookupError:
+                    pass
+            await worker.communicate()
+            LOG.info("model process %s stopped", worker.pid)
 
-            state["model"] = transcribe_cpp.Model(MODEL_PATH, backend="cpu")
-        return state["model"]
+    async def claim():
+        owner = {"task": asyncio.current_task(), "replaced": False}
+        async with lock:
+            old = state["active"]
+            if old is not None:
+                old["replaced"] = True
+                old["task"].cancel()
+                await kill_worker()
+            state["active"] = owner
+        return owner
+
+    async def release(owner, completed):
+        async with lock:
+            # Old cleanup must never stop the replacement's model process.
+            if state["active"] is owner:
+                if not completed:
+                    await kill_worker()
+                state["active"] = None
+
+    async def call(owner, command):
+        if state["active"] is not owner:
+            raise asyncio.CancelledError()
+        worker = state["worker"]
+        if worker is None:
+            spawning = asyncio.create_task(
+                asyncio.create_subprocess_exec(
+                    *worker_command,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    limit=4 * 1024 * 1024,
+                    env={**os.environ, "MODEL_PATH": MODEL_PATH},
+                )
+            )
+            try:
+                worker = await asyncio.shield(spawning)
+            except asyncio.CancelledError:
+                worker = await spawning
+                try:
+                    worker.kill()
+                except ProcessLookupError:
+                    pass
+                await worker.communicate()
+                raise
+            state["worker"] = worker
+            LOG.info("model process %s started", worker.pid)
+        started = time.monotonic()
+        LOG.info("model %s %s started", worker.pid, command["type"])
+        worker.stdin.write((json.dumps(command) + "\n").encode())
+        await worker.stdin.drain()
+        line = await worker.stdout.readline()
+        if not line:
+            raise RuntimeError("Model process exited before replying")
+        LOG.info(
+            "model %s %s returned after %.3fs",
+            worker.pid,
+            command["type"],
+            time.monotonic() - started,
+        )
+        return json.loads(line)
 
     @asynccontextmanager
     async def lifespan(_app):
-        yield
-        if state["model"] is not None:
-            state["model"].close()
+        try:
+            yield
+        finally:
+            await kill_worker()
 
     app = FastAPI(lifespan=lifespan)
 
@@ -107,269 +164,232 @@ def create_app(*, model=None, token=None):
 
     @app.post("/transcribe")
     async def transcribe(request: Request):
-        authorization = request.headers.get("authorization", "")
-        if not hmac.compare_digest(authorization, f"Bearer {token}"):
+        if not hmac.compare_digest(
+            request.headers.get("authorization", ""), f"Bearer {token}"
+        ):
             raise HTTPException(status_code=401, detail="unauthorized")
-        if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "audio/wav":
-            raise HTTPException(status_code=415, detail="Content-Type must be audio/wav")
-
+        if (
+            request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+            != "audio/wav"
+        ):
+            raise HTTPException(
+                status_code=415, detail="Content-Type must be audio/wav"
+            )
         with tempfile.SpooledTemporaryFile(max_size=1024 * 1024) as upload:
             total = 0
             async for part in request.stream():
                 total += len(part)
                 if total > MAX_WAV_BYTES:
-                    raise HTTPException(status_code=413, detail="WAV body exceeds 128 MiB")
+                    raise HTTPException(
+                        status_code=413, detail="WAV body exceeds 128 MiB"
+                    )
                 upload.write(part)
-            if total == 0:
-                raise HTTPException(status_code=400, detail="WAV body is empty")
             upload.seek(0)
             try:
                 wav = wave.open(upload, "rb")
             except (wave.Error, EOFError, OSError, ValueError):
-                raise HTTPException(status_code=400, detail="Invalid WAV file") from None
+                raise HTTPException(
+                    status_code=400, detail="Invalid WAV file"
+                ) from None
             with wav:
-                channels, width, rate, frames = (
-                    wav.getnchannels(), wav.getsampwidth(), wav.getframerate(), wav.getnframes()
-                )
-                if channels != 1 or width != 2 or rate != 16000 or frames == 0:
-                    raise HTTPException(status_code=400, detail="WAV must contain nonempty 16 kHz mono PCM16")
-                if not state["active"].acquire(blocking=False):
-                    return JSONResponse({"error": "transcription already in progress"}, status_code=503,
-                                        headers={"Retry-After": "2"})
-                session = None
-                decoder = None
+                frames = wav.getnframes()
+                if (wav.getnchannels(), wav.getsampwidth(), wav.getframerate()) != (
+                    1,
+                    2,
+                    16000,
+                ) or not frames:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="WAV must contain nonempty 16 kHz mono PCM16",
+                    )
+                owner = await claim()
+                completed = False
                 try:
-                    model_value = await _native_call(get_or_load_model)
-                    session = await _native_call(lambda: model_value.session(n_threads=2))
-                    decoder = await _native_call(session.stream)
+                    await call(owner, {"type": "start"})
                     remaining = frames
                     while remaining:
-                        count = min(16_000, remaining)
+                        count = min(16000, remaining)
                         raw = wav.readframes(count)
                         if len(raw) != count * 2:
-                            raise HTTPException(status_code=400, detail="WAV frame data is truncated")
+                            raise HTTPException(
+                                status_code=400, detail="WAV frame data is truncated"
+                            )
                         pcm16 = array.array("h")
                         pcm16.frombytes(raw)
                         if sys.byteorder == "big":
                             pcm16.byteswap()
                         pcm = array.array("f", (value / 32768.0 for value in pcm16))
-                        await _native_call(lambda pcm=pcm: decoder.feed(pcm))
+                        if sys.byteorder == "big":
+                            pcm.byteswap()
+                        await call(
+                            owner,
+                            {
+                                "type": "feed",
+                                "audio": base64.b64encode(pcm.tobytes()).decode(),
+                            },
+                        )
                         remaining -= count
-                    await _native_call(decoder.finalize)
-                    return {"text": decoder.text().full.strip()}
+                    result = await call(owner, {"type": "finish"})
+                    completed = True
+                    await release(owner, True)
+                    return {"text": result["text"]}
+                except asyncio.CancelledError:
+                    if not owner["replaced"]:
+                        raise
+                    return JSONResponse(
+                        {"error": "replaced by a newer recording"}, status_code=409
+                    )
                 except HTTPException:
                     raise
                 except Exception:
                     LOG.exception("history transcription failed")
-                    return JSONResponse({"error": "transcription failed"}, status_code=500)
+                    return JSONResponse(
+                        {"error": "transcription failed"}, status_code=500
+                    )
                 finally:
-                    try:
-                        if decoder is not None:
-                            decoder.reset()
-                    finally:
-                        try:
-                            if session is not None:
-                                session.close()
-                        finally:
-                            state["active"].release()
+                    await release(owner, completed)
 
     @app.websocket("/stream")
     async def stream(websocket: WebSocket):
-        authorization = websocket.headers.get("authorization", "")
-        if not hmac.compare_digest(authorization, f"Bearer {token}"):
+        if not hmac.compare_digest(
+            websocket.headers.get("authorization", ""), f"Bearer {token}"
+        ):
             await websocket.close(code=1008, reason="unauthorized")
             return
-        if not state["active"].acquire(blocking=False):
-            await websocket.accept()
-            await websocket.send_json({"type": "error", "message": "busy"})
-            await websocket.close(code=1013, reason="busy")
-            return
-
-        session = None
-        decoder = None
-        accepted = False
-        heartbeat = None
-        receiver = None
-        phase = "waiting for start"
-        abandoned = asyncio.Event()
+        await websocket.accept()
+        websocket.state.send_lock = asyncio.Lock()
+        owner = None
+        receiver = heartbeat = None
+        completed = False
+        cancelled = disconnected = False
         incoming = asyncio.Queue()
         queued_bytes = 0
-        received_samples = 0
-        processed_samples = 0
-        stream_id = id(websocket)
-        close_code = 1002
-        heartbeat_stop = asyncio.Event()
-        websocket.state.send_lock = asyncio.Lock()
+        stop = asyncio.Event()
+        task = asyncio.current_task()
 
-        async def receive_messages():
-            nonlocal queued_bytes, received_samples
+        async def send(message):
+            async with websocket.state.send_lock:
+                await websocket.send_json(message)
+
+        async def receive():
+            nonlocal cancelled, disconnected, queued_bytes
             try:
                 while True:
                     message = await websocket.receive()
                     if message["type"] == "websocket.disconnect":
-                        LOG.info("stream %s disconnected during %s", stream_id, phase)
+                        disconnected = True
                         return
-                    if message.get("text") is not None and _is_cancel(message["text"]):
-                        LOG.info("stream %s cancelled during %s; waiting for active native call if any",
-                                 stream_id, phase)
-                        abandoned.set()
-                        async with websocket.state.send_lock:
-                            await websocket.send_json({"type": "cancelled"})
-                            await websocket.close(code=1000)
-                        return
-                    data = message.get("bytes") or b""
-                    queued_bytes += len(data)
-                    received_samples += len(data) // 4
+                    if message.get("text") is not None:
+                        try:
+                            command = json.loads(message["text"])
+                        except (ValueError, TypeError):
+                            command = None
+                        if command == {"type": "cancel"}:
+                            cancelled = True
+                            return
+                    queued_bytes += len(message.get("bytes") or b"")
                     if queued_bytes > MAX_WAV_BYTES or incoming.qsize() >= 8192:
-                        LOG.warning("stream %s audio backlog exceeds limit", stream_id)
-                        async with websocket.state.send_lock:
-                            await websocket.send_json({"type": "error", "message": "audio backlog exceeds limit"})
-                            await websocket.close(code=1009)
+                        await send(
+                            {"type": "error", "message": "audio backlog exceeds limit"}
+                        )
                         return
                     incoming.put_nowait(message)
             except (WebSocketDisconnect, RuntimeError):
-                LOG.info("stream %s disconnected during %s", stream_id, phase)
-            except Exception:
-                LOG.exception("stream %s receiver failed during %s", stream_id, phase)
+                disconnected = True
             finally:
-                abandoned.set()
-                incoming.put_nowait({"type": "websocket.disconnect"})
-
-        async def native(function, operation):
-            nonlocal phase
-            phase = operation
-            started = time.monotonic()
-            LOG.info("stream %s native %s started; received=%s processed=%s samples",
-                     stream_id, phase, received_samples, processed_samples)
-            try:
-                return await _native_call(function)
-            finally:
-                LOG.info("stream %s native %s returned after %.3fs; abandoned=%s",
-                         stream_id, operation, time.monotonic() - started, abandoned.is_set())
+                if not completed:
+                    task.cancel()
 
         try:
-            await websocket.accept()
-            accepted = True
-            heartbeat = asyncio.create_task(_progress(websocket, heartbeat_stop))
-            receiver = asyncio.create_task(receive_messages())
-            first = await incoming.get()
-            if abandoned.is_set():
-                close_code = 1000
-                return
-            if first.get("text") is None:
-                async with websocket.state.send_lock:
-                    await websocket.send_json({"type": "error", "message": "expected start message"})
-                return
+            first = await asyncio.wait_for(websocket.receive(), timeout=20)
             try:
-                start = json.loads(first["text"])
+                start = json.loads(first.get("text") or "")
             except (ValueError, TypeError):
                 start = None
+            if start == {"type": "cancel"}:
+                await send({"type": "cancelled"})
+                return
             if start != {"type": "start", "sample_rate": 16000, "format": "f32le"}:
-                async with websocket.state.send_lock:
-                    await websocket.send_json({"type": "error", "message": "invalid start message"})
+                await send({"type": "error", "message": "invalid start message"})
                 return
-            model_value = await native(get_or_load_model, "loading model")
-            if abandoned.is_set():
-                return
-            session = await native(lambda: model_value.session(n_threads=2), "creating session")
-            if abandoned.is_set():
-                return
-            decoder = await native(session.stream, "creating decoder")
-            if abandoned.is_set():
-                return
-            async with websocket.state.send_lock:
-                await websocket.send_json({"type": "ready"})
-
+            owner = await claim()
+            receiver = asyncio.create_task(receive())
+            heartbeat = asyncio.create_task(_progress(websocket, stop))
+            await send(await call(owner, {"type": "start"}))
             while True:
-                phase = "waiting for audio"
                 message = await incoming.get()
-                queued_bytes -= len(message.get("bytes") or b"")
-                if abandoned.is_set():
-                    close_code = 1000
-                    return
-                if message["type"] == "websocket.disconnect":
-                    return
-                if message.get("bytes") is not None:
-                    pcm = _valid_pcm(message["bytes"])
-                    if pcm is None:
-                        await websocket.send_json({"type": "error", "message": "invalid PCM frame"})
+                audio = message.get("bytes")
+                if audio is not None:
+                    queued_bytes -= len(audio)
+                    if _valid_pcm(audio) is None:
+                        await send({"type": "error", "message": "invalid PCM frame"})
                         return
-                    await native(lambda pcm=pcm: decoder.feed(pcm), "processing audio")
-                    processed_samples += len(pcm)
-                    if abandoned.is_set():
-                        close_code = 1000
-                        return
-                    text = decoder.text()
-                    async with websocket.state.send_lock:
-                        await websocket.send_json({
-                            "type": "partial", "committed": text.committed, "tentative": text.tentative
-                        })
+                    await send(
+                        await call(
+                            owner,
+                            {"type": "feed", "audio": base64.b64encode(audio).decode()},
+                        )
+                    )
                     continue
                 try:
                     command = json.loads(message.get("text") or "")
                 except (ValueError, TypeError):
                     command = None
                 if command != {"type": "finish"}:
-                    await websocket.send_json({"type": "error", "message": "expected binary PCM or finish"})
+                    await send(
+                        {"type": "error", "message": "expected binary PCM or finish"}
+                    )
                     return
-                await native(decoder.finalize, "finishing")
-                if abandoned.is_set():
-                    close_code = 1000
-                    return
-                async with websocket.state.send_lock:
-                    await websocket.send_json({"type": "final", "text": decoder.text().full.strip()})
-                close_code = 1000
+                result = await call(owner, {"type": "finish"})
+                completed = True
+                await release(owner, True)
+                await send(result)
                 return
+        except asyncio.CancelledError:
+            if owner is not None:
+                await release(owner, False)
+            try:
+                if owner is not None and owner["replaced"]:
+                    await send(
+                        {"type": "error", "message": "replaced by a newer recording"}
+                    )
+                elif cancelled:
+                    await send({"type": "cancelled"})
+                elif not disconnected:
+                    raise
+            except (WebSocketDisconnect, RuntimeError):
+                pass
         except WebSocketDisconnect:
             pass
         except Exception:
-            close_code = 1011
             LOG.exception("stream transcription failed")
-            if accepted:
-                try:
-                    async with websocket.state.send_lock:
-                        await websocket.send_json({"type": "error", "message": "transcription failed"})
-                except Exception:
-                    pass
-        finally:
-            LOG.info("stream %s cleanup started during %s", stream_id, phase)
-            heartbeat_stop.set()
-            if receiver:
-                receiver.cancel()
-                try:
-                    await receiver
-                except asyncio.CancelledError:
-                    pass
             try:
-                if heartbeat:
-                    heartbeat.cancel()
+                await send({"type": "error", "message": "transcription failed"})
+            except Exception:
+                pass
+        finally:
+            # Prevent receiver shutdown from cancelling this cleanup.
+            stop.set()
+            finished = completed
+            completed = True
+            for background in (receiver, heartbeat):
+                if background:
+                    background.cancel()
                     try:
-                        await heartbeat
+                        await background
                     except asyncio.CancelledError:
                         pass
-                if accepted:
-                    try:
-                        await websocket.close(code=close_code)
-                    except Exception:
-                        pass
-            finally:
-                try:
-                    if decoder is not None:
-                        decoder.reset()
-                finally:
-                    try:
-                        if session is not None:
-                            session.close()
-                    finally:
-                        state["active"].release()
-                        LOG.info("stream %s slot released; received=%s processed=%s samples",
-                                 stream_id, received_samples, processed_samples)
+            if owner is not None:
+                await release(owner, finished)
+            try:
+                await websocket.close(code=1000)
+            except Exception:
+                pass
 
     return app
 
 
 app = create_app()
-
 
 if __name__ == "__main__":
     import uvicorn

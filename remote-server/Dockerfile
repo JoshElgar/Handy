@@ -42,7 +42,7 @@ RUN python -m pip install --no-cache-dir \
       -o /app/models/parakeet-unified-en-0.6b-Q8_0.gguf
 
 WORKDIR /app
-COPY server.py test_server.py ./
+COPY server.py model_worker.py test_server.py ./
 RUN API_TOKEN=test-secret python -c 'import transcribe_cpp; assert transcribe_cpp.backend_available("cpu"), transcribe_cpp.backends()' \
     && python -m unittest -v test_server
 
