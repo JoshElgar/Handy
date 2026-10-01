@@ -2,6 +2,7 @@ import array
 import io
 import os
 import struct
+import threading
 import sys
 import time
 import types
@@ -36,6 +37,8 @@ class FakeStream:
     def feed(self, pcm):
         if self.owner.fail_feed:
             raise RuntimeError("native feed failure")
+        self.owner.feed_started.set()
+        self.owner.feed_release.wait()
         if self.owner.feed_delay:
             time.sleep(self.owner.feed_delay)
         self.owner.received.extend(pcm)
@@ -77,6 +80,9 @@ class FakeModel:
         self.transcribed_samples = 0
         self.reset_count = 0
         self.session_close_count = 0
+        self.feed_started = threading.Event()
+        self.feed_release = threading.Event()
+        self.feed_release.set()
         self.feed_delay = 0
         self.finalize_delay = 0
         self.fail_feed = False
@@ -208,6 +214,44 @@ class ServerTests(unittest.TestCase):
             self.start(ws)
             ws.send_json({"type": "finish"})
             self.assertEqual(ws.receive_json()["type"], "final")
+
+    def test_cancel_discards_backlog_and_releases_slot_after_active_feed(self):
+        self.model.feed_release.clear()
+        try:
+            with self.connect() as ws:
+                self.start(ws)
+                ws.send_bytes(struct.pack("<f", 0.25))
+                self.assertTrue(self.model.feed_started.wait(1))
+                for _ in range(10):
+                    ws.send_bytes(struct.pack("<f", 0.5))
+                with self.assertLogs("parakeet-server", level="INFO") as logs:
+                    ws.send_json({"type": "cancel"})
+                    # The receiver must notice cancel while the native call is blocked.
+                    self.assertEqual(ws.receive_json(), {"type": "cancelled"})
+                self.assertTrue(any("processing" in line for line in logs.output))
+                with self.connect() as busy:
+                    self.assertEqual(busy.receive_json(), {"type": "error", "message": "busy"})
+                self.model.feed_release.set()
+            self.wait_for_close_count(1)
+            self.assertEqual(len(self.model.received), 1)
+            self.assertIsNone(self.model.finalized_samples)
+            with self.connect() as next_ws:
+                self.start(next_ws)
+                next_ws.send_json({"type": "finish"})
+                self.assertEqual(next_ws.receive_json()["type"], "final")
+        finally:
+            self.model.feed_release.set()
+
+    def test_cancel_before_ready_does_not_load_model(self):
+        with self.connect() as ws:
+            ws.send_json({"type": "cancel"})
+            self.assertEqual(ws.receive_json(), {"type": "cancelled"})
+        self.wait_for_close_count(0)
+        with self.connect() as ws:
+            self.start(ws)
+            ws.send_json({"type": "cancel"})
+            self.assertEqual(ws.receive_json(), {"type": "cancelled"})
+        self.wait_for_close_count(1)
 
     def test_history_retry_accepts_audio_longer_than_one_minute(self):
         response = self.client.post(

@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import wave
 from contextlib import asynccontextmanager
 
@@ -72,6 +73,13 @@ async def _native_call(function):
             await work
         finally:
             raise
+
+
+def _is_cancel(text):
+    try:
+        return json.loads(text) == {"type": "cancel"}
+    except (ValueError, TypeError):
+        return False
 
 
 def create_app(*, model=None, token=None):
@@ -181,14 +189,73 @@ def create_app(*, model=None, token=None):
         decoder = None
         accepted = False
         heartbeat = None
+        receiver = None
+        phase = "waiting for start"
+        abandoned = asyncio.Event()
+        incoming = asyncio.Queue()
+        queued_bytes = 0
+        received_samples = 0
+        processed_samples = 0
+        stream_id = id(websocket)
         close_code = 1002
         heartbeat_stop = asyncio.Event()
         websocket.state.send_lock = asyncio.Lock()
+
+        async def receive_messages():
+            nonlocal queued_bytes, received_samples
+            try:
+                while True:
+                    message = await websocket.receive()
+                    if message["type"] == "websocket.disconnect":
+                        LOG.info("stream %s disconnected during %s", stream_id, phase)
+                        return
+                    if message.get("text") is not None and _is_cancel(message["text"]):
+                        LOG.info("stream %s cancelled during %s; waiting for active native call if any",
+                                 stream_id, phase)
+                        abandoned.set()
+                        async with websocket.state.send_lock:
+                            await websocket.send_json({"type": "cancelled"})
+                            await websocket.close(code=1000)
+                        return
+                    data = message.get("bytes") or b""
+                    queued_bytes += len(data)
+                    received_samples += len(data) // 4
+                    if queued_bytes > MAX_WAV_BYTES or incoming.qsize() >= 8192:
+                        LOG.warning("stream %s audio backlog exceeds limit", stream_id)
+                        async with websocket.state.send_lock:
+                            await websocket.send_json({"type": "error", "message": "audio backlog exceeds limit"})
+                            await websocket.close(code=1009)
+                        return
+                    incoming.put_nowait(message)
+            except (WebSocketDisconnect, RuntimeError):
+                LOG.info("stream %s disconnected during %s", stream_id, phase)
+            except Exception:
+                LOG.exception("stream %s receiver failed during %s", stream_id, phase)
+            finally:
+                abandoned.set()
+                incoming.put_nowait({"type": "websocket.disconnect"})
+
+        async def native(function, operation):
+            nonlocal phase
+            phase = operation
+            started = time.monotonic()
+            LOG.info("stream %s native %s started; received=%s processed=%s samples",
+                     stream_id, phase, received_samples, processed_samples)
+            try:
+                return await _native_call(function)
+            finally:
+                LOG.info("stream %s native %s returned after %.3fs; abandoned=%s",
+                         stream_id, operation, time.monotonic() - started, abandoned.is_set())
+
         try:
             await websocket.accept()
             accepted = True
             heartbeat = asyncio.create_task(_progress(websocket, heartbeat_stop))
-            first = await websocket.receive()
+            receiver = asyncio.create_task(receive_messages())
+            first = await incoming.get()
+            if abandoned.is_set():
+                close_code = 1000
+                return
             if first.get("text") is None:
                 async with websocket.state.send_lock:
                     await websocket.send_json({"type": "error", "message": "expected start message"})
@@ -201,14 +268,25 @@ def create_app(*, model=None, token=None):
                 async with websocket.state.send_lock:
                     await websocket.send_json({"type": "error", "message": "invalid start message"})
                 return
-            model_value = await _native_call(get_or_load_model)
-            session = await _native_call(lambda: model_value.session(n_threads=2))
-            decoder = await _native_call(session.stream)
+            model_value = await native(get_or_load_model, "loading model")
+            if abandoned.is_set():
+                return
+            session = await native(lambda: model_value.session(n_threads=2), "creating session")
+            if abandoned.is_set():
+                return
+            decoder = await native(session.stream, "creating decoder")
+            if abandoned.is_set():
+                return
             async with websocket.state.send_lock:
                 await websocket.send_json({"type": "ready"})
 
             while True:
-                message = await websocket.receive()
+                phase = "waiting for audio"
+                message = await incoming.get()
+                queued_bytes -= len(message.get("bytes") or b"")
+                if abandoned.is_set():
+                    close_code = 1000
+                    return
                 if message["type"] == "websocket.disconnect":
                     return
                 if message.get("bytes") is not None:
@@ -216,7 +294,11 @@ def create_app(*, model=None, token=None):
                     if pcm is None:
                         await websocket.send_json({"type": "error", "message": "invalid PCM frame"})
                         return
-                    await _native_call(lambda pcm=pcm: decoder.feed(pcm))
+                    await native(lambda pcm=pcm: decoder.feed(pcm), "processing audio")
+                    processed_samples += len(pcm)
+                    if abandoned.is_set():
+                        close_code = 1000
+                        return
                     text = decoder.text()
                     async with websocket.state.send_lock:
                         await websocket.send_json({
@@ -230,7 +312,10 @@ def create_app(*, model=None, token=None):
                 if command != {"type": "finish"}:
                     await websocket.send_json({"type": "error", "message": "expected binary PCM or finish"})
                     return
-                await _native_call(decoder.finalize)
+                await native(decoder.finalize, "finishing")
+                if abandoned.is_set():
+                    close_code = 1000
+                    return
                 async with websocket.state.send_lock:
                     await websocket.send_json({"type": "final", "text": decoder.text().full.strip()})
                 close_code = 1000
@@ -247,7 +332,14 @@ def create_app(*, model=None, token=None):
                 except Exception:
                     pass
         finally:
+            LOG.info("stream %s cleanup started during %s", stream_id, phase)
             heartbeat_stop.set()
+            if receiver:
+                receiver.cancel()
+                try:
+                    await receiver
+                except asyncio.CancelledError:
+                    pass
             try:
                 if heartbeat:
                     heartbeat.cancel()
@@ -270,6 +362,8 @@ def create_app(*, model=None, token=None):
                             session.close()
                     finally:
                         state["active"].release()
+                        LOG.info("stream %s slot released; received=%s processed=%s samples",
+                                 stream_id, received_samples, processed_samples)
 
     return app
 
@@ -280,11 +374,13 @@ app = create_app()
 if __name__ == "__main__":
     import uvicorn
 
+    logging.basicConfig(level=logging.INFO)
     uvicorn.run(
         app,
         host="0.0.0.0",
         port=int(os.environ.get("PORT", "10000")),
         workers=1,
-        ws_ping_timeout=None,
+        ws_ping_interval=20,
+        ws_ping_timeout=20,
         ws_max_size=MAX_FRAME_BYTES,
     )

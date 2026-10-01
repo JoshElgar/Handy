@@ -82,6 +82,7 @@ pub(crate) enum RemoteCommand {
 enum ServerMessage {
     Ready,
     Progress,
+    Cancelled,
     Partial {
         committed: String,
         tentative: String,
@@ -103,30 +104,46 @@ pub(crate) async fn stream(
     if *cancel.borrow() {
         return Ok(None);
     }
-    let cancelled = async {
-        loop {
-            if *cancel.borrow() || cancel.changed().await.is_err() {
-                return;
-            }
+    let mut request = config
+        .stream_url
+        .as_str()
+        .into_client_request()
+        .context("Failed to build remote stream request")?;
+    request.headers_mut().insert(
+        tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
+        tokio_tungstenite::tungstenite::http::HeaderValue::from_str(&config.bearer())?,
+    );
+    let (socket, _) = tokio::select! {
+        biased;
+        _ = wait_for_cancel(&mut cancel) => return Ok(None),
+        result = tokio::time::timeout(Duration::from_secs(20), tokio_tungstenite::connect_async(request)) => {
+            result.context("Remote stream connection timed out")?
+                .context("Failed to connect to remote transcription stream")?
         }
     };
-    tokio::select! {
-        biased;
-        result = async {
-            let mut request = config.stream_url.as_str().into_client_request()
-                .context("Failed to build remote stream request")?;
-            request.headers_mut().insert(
-                tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
-                tokio_tungstenite::tungstenite::http::HeaderValue::from_str(&config.bearer())?,
-            );
-            let (socket, _) = tokio::time::timeout(
-                Duration::from_secs(20), tokio_tungstenite::connect_async(request),
-            ).await.context("Remote stream connection timed out")?
-                .context("Failed to connect to remote transcription stream")?;
-            run_stream(socket, commands, &mut emit, STREAM_IDLE_TIMEOUT).await
-        } => result,
-        _ = cancelled => Ok(None),
+    run_stream(socket, commands, &mut emit, STREAM_IDLE_TIMEOUT, cancel).await
+}
+
+async fn wait_for_cancel(cancel: &mut watch::Receiver<bool>) {
+    while !*cancel.borrow() {
+        if cancel.changed().await.is_err() {
+            break;
+        }
     }
+}
+
+async fn cancel_socket<S>(socket: &mut S)
+where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    // Cancellation abandons queued audio; a bounded send cannot keep the app busy.
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        socket
+            .send(Message::Text(json!({"type":"cancel"}).to_string().into()))
+            .await?;
+        socket.send(Message::Close(None)).await
+    })
+    .await;
 }
 
 async fn run_stream<S>(
@@ -134,6 +151,7 @@ async fn run_stream<S>(
     mut commands: mpsc::UnboundedReceiver<RemoteCommand>,
     emit: &mut impl FnMut(String, String),
     idle_timeout: Duration,
+    mut cancel: watch::Receiver<bool>,
 ) -> Result<Option<String>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -151,11 +169,16 @@ where
 
     let mut last_inbound = tokio::time::Instant::now();
     loop {
-        let inbound = tokio::time::timeout_at(last_inbound + idle_timeout, socket.next())
-            .await
-            .context(
-                "Remote transcription stream made no progress before the inactivity deadline",
-            )?;
+        let inbound = tokio::select! {
+            biased;
+            _ = wait_for_cancel(&mut cancel) => {
+                cancel_socket(&mut socket).await;
+                return Ok(None);
+            }
+            result = tokio::time::timeout_at(last_inbound + idle_timeout, socket.next()) => {
+                result.context("Remote transcription stream made no progress before the inactivity deadline")?
+            }
+        };
         let Some(inbound) = inbound else {
             bail!("Remote transcription stream closed before ready");
         };
@@ -167,6 +190,7 @@ where
             {
                 ServerMessage::Ready => break,
                 ServerMessage::Progress => {}
+                ServerMessage::Cancelled => return Ok(None),
                 ServerMessage::Partial {
                     committed,
                     tentative,
@@ -186,39 +210,54 @@ where
     }
 
     let (mut writer, mut reader) = socket.split();
+    let (pong_tx, mut pong_rx) = mpsc::unbounded_channel();
     let writer = async {
-        while let Some(command) = commands.recv().await {
-            match command {
-                RemoteCommand::Audio(samples) => {
-                    for chunk in samples.chunks(MAX_AUDIO_FRAME_BYTES / 4) {
-                        let mut bytes = Vec::with_capacity(chunk.len() * 4);
-                        for sample in chunk {
-                            bytes.extend_from_slice(&sample.to_le_bytes());
-                        }
-                        writer
-                            .send(Message::Binary(bytes.into()))
-                            .await
-                            .context("Failed to send audio to remote transcription stream")?;
-                    }
-                }
-                RemoteCommand::Finish => {
-                    writer
-                        .send(Message::Text(json!({"type":"finish"}).to_string().into()))
-                        .await
-                        .context("Failed to finish remote transcription stream")?;
+        let mut finished = false;
+        loop {
+            tokio::select! {
+                biased;
+                _ = wait_for_cancel(&mut cancel) => {
+                    cancel_socket(&mut writer).await;
                     return Ok::<(), anyhow::Error>(());
+                }
+                Some(payload) = pong_rx.recv() => {
+                    writer.send(Message::Pong(payload)).await
+                        .context("Failed to answer remote ping")?;
+                }
+                command = commands.recv(), if !finished => {
+                    match command {
+                        Some(RemoteCommand::Audio(samples)) => {
+                            for chunk in samples.chunks(MAX_AUDIO_FRAME_BYTES / 4) {
+                                let bytes: Vec<u8> = chunk.iter().flat_map(|sample| sample.to_le_bytes()).collect();
+                                tokio::select! {
+                                    biased;
+                                    _ = wait_for_cancel(&mut cancel) => {
+                                        cancel_socket(&mut writer).await;
+                                        return Ok(());
+                                    }
+                                    result = writer.send(Message::Binary(bytes.into())) => {
+                                        result.context("Failed to send audio to remote transcription stream")?;
+                                    }
+                                }
+                            }
+                        }
+                        Some(RemoteCommand::Finish) => {
+                            writer.send(Message::Text(json!({"type":"finish"}).to_string().into())).await
+                                .context("Failed to finish remote transcription stream")?;
+                            finished = true;
+                        }
+                        None => bail!("Remote audio queue closed before finish"),
+                    }
                 }
             }
         }
-        bail!("Remote audio queue closed before finish")
     };
     tokio::pin!(writer);
-    let mut writer_finished = false;
     loop {
         tokio::select! {
-            result = &mut writer, if !writer_finished => {
+            result = &mut writer => {
                 result?;
-                writer_finished = true;
+                return Ok(None);
             }
             inbound = tokio::time::timeout_at(last_inbound + idle_timeout, reader.next()) => {
                 let message = inbound
@@ -231,13 +270,14 @@ where
                         match serde_json::from_str::<ServerMessage>(&text).context("Invalid remote transcription response")? {
                             ServerMessage::Ready => {},
                             ServerMessage::Progress => {},
+                            ServerMessage::Cancelled => return Ok(None),
                             ServerMessage::Partial { committed, tentative } => emit(committed, tentative),
                             ServerMessage::Final { text } => return Ok(Some(text)),
                             ServerMessage::Error { message } => bail!("Remote transcription failed: {message}"),
                         }
                     }
                     Message::Close(frame) => bail!("Remote transcription stream closed: {frame:?}"),
-                    Message::Ping(_) => {},
+                    Message::Ping(payload) => { let _ = pong_tx.send(payload); },
                     Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {},
                 }
             }
@@ -426,7 +466,7 @@ mod tests {
             .unwrap();
         });
         let (tx, rx) = mpsc::unbounded_channel();
-        let (_cancel_tx, _cancel_rx) = watch::channel(false);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
         tx.send(RemoteCommand::Finish).unwrap();
         let mut noop = |_, _| {};
         let tcp = TcpStream::connect(address).await.unwrap();
@@ -436,7 +476,7 @@ mod tests {
             .0;
         let result = tokio::time::timeout(
             Duration::from_millis(250),
-            run_stream(socket, rx, &mut noop, Duration::from_millis(75)),
+            run_stream(socket, rx, &mut noop, Duration::from_millis(75), cancel_rx),
         )
         .await
         .unwrap()
@@ -465,7 +505,24 @@ mod tests {
                 Message::Binary(_)
             ));
             let _ = audio_tx.send(());
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            loop {
+                match ws.next().await.unwrap().unwrap() {
+                    Message::Text(text) if text.contains("cancel") => {
+                        ws.send(Message::Text(
+                            json!({"type":"cancelled"}).to_string().into(),
+                        ))
+                        .await
+                        .unwrap();
+                        assert!(matches!(
+                            ws.next().await.unwrap().unwrap(),
+                            Message::Close(_)
+                        ));
+                        return;
+                    }
+                    Message::Binary(_) => {}
+                    message => panic!("unexpected cancellation message: {message:?}"),
+                }
+            }
         });
         let (tx, rx) = mpsc::unbounded_channel();
         let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -485,7 +542,10 @@ mod tests {
             .unwrap()
             .unwrap()
             .is_none());
-        server.abort();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
 
         let (address2, listener2) = TcpListener::bind("127.0.0.1:0")
             .await

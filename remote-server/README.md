@@ -22,7 +22,11 @@ Connect to wss://HOST/stream with Authorization: Bearer TOKEN.
 3. Send binary little-endian float32 mono audio frames. Each frame must be 4-byte aligned and at most 64 KiB. The server processes frames in order; clients may send ahead while draining progress and partial messages concurrently.
 4. After sending every frame, send {"type":"finish"}. The server drains all accepted audio, finalizes the model stream, emits {"type":"final","text":"..."}, then closes normally. Final text is the native stream's full hypothesis, including any tentative tail.
 
-Each audio chunk gets a partial message with committed and tentative text. A malformed frame or protocol message produces an error and closes the stream. An occupied server emits {"type":"error","message":"busy"} then closes with code 1013. Disconnecting abandons the stream; the model is reusable after any native call already in progress has returned. Slow audio backlogs do not hit a WebSocket ping deadline; the client inactivity deadline still applies.
+Each audio chunk gets a partial message with committed and tentative text. A malformed frame or protocol message produces an error and closes the stream. An occupied server emits {"type":"error","message":"busy"} then closes with code 1013. For Cancel, send {"type":"cancel"} and close the socket. The server acknowledges {"type":"cancelled"}, discards queued audio, and notices disconnects even during inference. The model becomes reusable after the active native call returns; its memory is never freed underneath an active call. Cancellation acknowledgement confirms receipt, not that inference has already stopped.
+
+The server checks WebSocket ping/pong every 20 seconds with a 20-second response deadline. The client continues answering while waiting for the final transcript. These checks detect a dead connection, not slow transcription. Received audio is limited to a 128 MiB backlog or 8192 queued messages; exceeding either closes the stream with an explicit error. Ordinary Finish still drains every accepted frame in order.
+
+Logs identify each stream and record cancellation/disconnect, the active phase, native-call start and return times, received/processed sample counts, and slot release. A native call start followed by cancellation without a matching return identifies an outstanding model call; it does not by itself prove that the call is permanently hung.
 
 ## History retry
 
