@@ -42,7 +42,7 @@ class ModelWorker:
                 path = self.registry.ensure_file(entry["slug"])
                 self.model = self.engine.Model(path, backend="cpu")
                 self.model_id = entry["slug"]
-            self.caps = self.model.capabilities()
+            self.caps = self.model.capabilities
             self.session = self.model.session(n_threads=2)
             languages = self.caps.languages or tuple(entry["languages"])
             intent = command.get("language", "auto")

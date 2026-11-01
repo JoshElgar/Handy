@@ -61,6 +61,7 @@ class FakeEngine:
                     raise AssertionError("two models loaded")
                 engine.loads.append(path)
                 self.streaming = "batch" not in str(path)
+            @property
             def capabilities(self):
                 return SimpleNamespace(supports_streaming=self.streaming, languages=("en",),
                     supports_language_detect=False, supports_translate=False, max_audio_ms=100)
