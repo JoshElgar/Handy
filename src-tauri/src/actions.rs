@@ -556,8 +556,15 @@ impl ShortcutAction for TranscribeAction {
                 let app_clone = app.clone();
                 let rm_clone = Arc::clone(&rm);
                 std::thread::spawn(move || {
-                    if !readiness.wait() {
-                        debug!("Microphone readiness wait ended without receiving samples");
+                    if !readiness.wait_timeout(Duration::from_secs(5)) {
+                        if rm_clone.is_recording_readiness_current(generation) {
+                            error!("Microphone did not produce samples within 5 seconds");
+                            utils::cancel_current_operation(&app_clone);
+                            let _ = app_clone.emit("recording-error", RecordingErrorEvent {
+                                error_type: "unknown".into(),
+                                detail: Some("Microphone did not produce audio. Check the input device and try again.".into()),
+                            });
+                        }
                         return;
                     }
 

@@ -20,7 +20,7 @@ if __name__ == "__main__" and "--worker" in sys.argv:
         kind = command["type"]
         if kind == "start":
             samples = 0
-            result = {"type": "ready", "pid": os.getpid()}
+            result = {"type": "ready", "pid": os.getpid(), "model": command.get("model")}
         elif kind == "feed":
             audio = base64.b64decode(command["audio"])
             value = struct.unpack("<f", audio[:4])[0]
@@ -85,6 +85,23 @@ class ServerTests(unittest.TestCase):
     def finish(self, ws):
         ws.send_json({"type": "finish"})
         self.assertEqual(ws.receive_json()["type"], "final")
+
+    def test_catalog_auth_model_selection_and_invalid_model_preserve_recording(self):
+        self.assertEqual(self.client.get("/models").status_code, 401)
+        models = self.client.get("/models", headers={"Authorization": "Bearer test-secret"}).json()
+        self.assertEqual(len(models), 69)
+        selected = next(m["id"] for m in models if "moonshine-streaming-small" in m["id"])
+        with self.connect() as active:
+            active.send_json({"type": "start", "sample_rate": 16000, "format": "f32le", "model": selected})
+            self.assertEqual(active.receive_json()["model"], selected)
+            with self.connect() as invalid:
+                invalid.send_json({"type": "start", "sample_rate": 16000, "format": "f32le", "model": "../../invalid"})
+                self.assertEqual(invalid.receive_json()["type"], "error")
+            self.finish(active)
+        headers = {"Authorization": "Bearer test-secret", "Content-Type": "audio/wav"}
+        self.assertEqual(self.client.post("/transcribe?model=bad", content=wav_bytes(), headers=headers).status_code, 400)
+        response = self.client.post(f"/transcribe?model={selected}", content=wav_bytes(), headers=headers)
+        self.assertEqual(response.json()["text"], "heard 160")
 
     def test_new_recording_kills_hung_model_and_reuses_successful_worker(self):
         with self.connect() as old:
@@ -166,7 +183,7 @@ class ServerTests(unittest.TestCase):
                 self.assertEqual(ws.receive_json()["type"], "error")
         headers = {"Authorization": "Bearer test-secret", "Content-Type": "audio/wav"}
         response = self.client.post("/transcribe", content=wav_bytes(), headers=headers)
-        self.assertEqual(response.json(), {"text": "heard 160"})
+        self.assertEqual(response.json()["text"], "heard 160")
         self.assertEqual(
             self.client.post(
                 "/transcribe", content=b"bad", headers=headers

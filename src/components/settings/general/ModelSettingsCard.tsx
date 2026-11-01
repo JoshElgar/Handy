@@ -5,6 +5,8 @@ import { LanguageSelector } from "../LanguageSelector";
 import { TranslateToEnglish } from "../TranslateToEnglish";
 import { useModelStore } from "../../../stores/modelStore";
 import type { ModelInfo } from "@/bindings";
+import { useSettings } from "@/hooks/useSettings";
+import { RemoteModelSettings } from "../RemoteModelSettings";
 import {
   CHINESE_LANGUAGE_CODE,
   getUniqueCapabilityLanguages,
@@ -13,6 +15,10 @@ import {
 export const ModelSettingsCard: React.FC = () => {
   const { t } = useTranslation();
   const { currentModel, models } = useModelStore();
+  const { getSetting } = useSettings();
+  if (getSetting("remote_transcription_url")?.trim()) {
+    return <RemoteModelSettings />;
+  }
 
   const currentModelInfo = models.find((m: ModelInfo) => m.id === currentModel);
 

@@ -20,6 +20,68 @@ fn unopened_recorder_does_not_need_reopen() {
 }
 
 #[test]
+fn microphone_startup_timeout_keeps_one_pending_worker_and_recovers() {
+    let mut recorder = AudioRecorder::new().unwrap();
+    let (init_tx, init_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        release_rx.recv().unwrap();
+        let _ = init_tx.send(Ok(()));
+    });
+    assert!(recorder
+        .wait_for_initialization(init_rx, worker, Duration::from_millis(10))
+        .is_err());
+    assert!(recorder.worker_handle.is_some());
+    assert!(recorder
+        .open(None)
+        .unwrap_err()
+        .to_string()
+        .contains("pending"));
+    release_tx.send(()).unwrap();
+    recorder.worker_handle.take().unwrap().join().unwrap();
+    assert!(recorder.close().is_ok());
+}
+
+#[test]
+fn microphone_startup_success_and_failure_do_not_leave_pending_workers() {
+    for success in [true, false] {
+        let mut recorder = AudioRecorder::new().unwrap();
+        let (init_tx, init_rx) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let _ = init_tx.send(if success {
+                Ok(())
+            } else {
+                Err("device missing".into())
+            });
+        });
+        let result = recorder.wait_for_initialization(init_rx, worker, Duration::from_secs(1));
+        assert_eq!(result.is_ok(), success);
+        if success {
+            recorder.worker_handle.take().unwrap().join().unwrap();
+        } else {
+            assert!(recorder.worker_handle.is_none());
+        }
+    }
+}
+
+#[test]
+fn microphone_pending_worker_close_returns_without_joining_stalled_driver() {
+    let mut recorder = AudioRecorder::new().unwrap();
+    let (release_tx, release_rx) = mpsc::channel();
+    recorder.worker_handle = Some(thread::spawn(move || {
+        release_rx.recv().unwrap();
+    }));
+    assert!(recorder
+        .close()
+        .unwrap_err()
+        .to_string()
+        .contains("pending"));
+    release_tx.send(()).unwrap();
+    recorder.worker_handle.take().unwrap().join().unwrap();
+    assert!(recorder.close().is_ok());
+}
+
+#[test]
 fn stream_error_requires_reopen() {
     let recorder = AudioRecorder::new().expect("recorder");
     recorder.stream_error.store(true, Ordering::Relaxed);

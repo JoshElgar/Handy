@@ -418,6 +418,17 @@ mod headless_guard_tests {
     use super::run_headless_guarded;
 
     #[test]
+    fn export_typescript_bindings() {
+        super::command_builder()
+            .export(
+                specta_typescript::Typescript::default()
+                    .bigint(specta_typescript::BigIntExportBehavior::Number),
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../src/bindings.ts"),
+            )
+            .expect("Failed to export TypeScript bindings");
+    }
+
+    #[test]
     fn preserves_normal_exit_codes() {
         assert_eq!(run_headless_guarded(|| 2), 2);
     }
@@ -620,34 +631,8 @@ fn run_headless_transcription(app: &AppHandle, args: &CliArgs) -> i32 {
     0
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run(cli_args: CliArgs) {
-    // Avoid ggml-metal residency-set teardown assertions when a native engine
-    // outlives the Tauri shutdown sequence (#1902). This must happen before
-    // transcribe-cpp initializes its Metal device. Advanced users can restore
-    // upstream residency behavior with HANDY_METAL_RESIDENCY=1.
-    #[cfg(target_os = "macos")]
-    if std::env::var("HANDY_METAL_RESIDENCY").as_deref() == Ok("1") {
-        // ggml treats GGML_METAL_NO_RESIDENCY as presence-based, so remove an
-        // inherited value as well when explicitly opting back in.
-        std::env::remove_var("GGML_METAL_NO_RESIDENCY");
-    } else {
-        std::env::set_var("GGML_METAL_NO_RESIDENCY", "1");
-    }
-
-    // Pin glibc's dynamic mmap threshold before the first large allocation,
-    // so per-dictation transient buffers are returned to the OS on free
-    // instead of accumulating in malloc arenas (#1792). No-op off Linux/glibc.
-    memory::init_allocator();
-
-    // Detect portable mode before anything else
-    portable::init();
-
-    // Parse console logging directives from RUST_LOG, falling back to info-level logging
-    // when the variable is unset
-    let console_filter = build_console_filter();
-
-    let specta_builder = Builder::<tauri::Wry>::new()
+fn command_builder() -> Builder<tauri::Wry> {
+    Builder::<tauri::Wry>::new()
         .commands(collect_commands![
             shortcut::change_binding,
             shortcut::reset_binding,
@@ -728,6 +713,8 @@ pub fn run(cli_args: CliArgs) {
             commands::initialize_enigo,
             commands::initialize_shortcuts,
             commands::models::get_available_models,
+            commands::models::get_remote_models,
+            commands::models::set_remote_model,
             commands::models::get_model_info,
             commands::models::download_model,
             commands::models::delete_model,
@@ -770,7 +757,37 @@ pub fn run(cli_args: CliArgs) {
             managers::history::HistoryUpdatePayload,
             managers::transcription::StreamTextEvent,
             managers::transcription::StreamPhaseEvent,
-        ]);
+        ])
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run(cli_args: CliArgs) {
+    // Avoid ggml-metal residency-set teardown assertions when a native engine
+    // outlives the Tauri shutdown sequence (#1902). This must happen before
+    // transcribe-cpp initializes its Metal device. Advanced users can restore
+    // upstream residency behavior with HANDY_METAL_RESIDENCY=1.
+    #[cfg(target_os = "macos")]
+    if std::env::var("HANDY_METAL_RESIDENCY").as_deref() == Ok("1") {
+        // ggml treats GGML_METAL_NO_RESIDENCY as presence-based, so remove an
+        // inherited value as well when explicitly opting back in.
+        std::env::remove_var("GGML_METAL_NO_RESIDENCY");
+    } else {
+        std::env::set_var("GGML_METAL_NO_RESIDENCY", "1");
+    }
+
+    // Pin glibc's dynamic mmap threshold before the first large allocation,
+    // so per-dictation transient buffers are returned to the OS on free
+    // instead of accumulating in malloc arenas (#1792). No-op off Linux/glibc.
+    memory::init_allocator();
+
+    // Detect portable mode before anything else
+    portable::init();
+
+    // Parse console logging directives from RUST_LOG, falling back to info-level logging
+    // when the variable is unset
+    let console_filter = build_console_filter();
+
+    let specta_builder = command_builder();
 
     #[cfg(debug_assertions)] // <- Only export on non-release builds
     specta_builder

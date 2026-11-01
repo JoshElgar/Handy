@@ -18,6 +18,8 @@ import {
   supportsLanguageCode,
 } from "@/lib/constants/languages.ts";
 import type { ModelInfo } from "@/bindings";
+import { useSettings } from "@/hooks/useSettings";
+import { RemoteModelSettings } from "../RemoteModelSettings";
 
 // check if model supports a language based on its supported_languages list
 const modelSupportsLanguage = (model: ModelInfo, langCode: string): boolean => {
@@ -31,6 +33,17 @@ const isLegacyModel = (model: ModelInfo): boolean =>
   typeof model.source === "object" && "Url" in model.source;
 
 export const ModelsSettings: React.FC = () => {
+  const { getSetting } = useSettings();
+  return getSetting("remote_transcription_url")?.trim() ? (
+    <div className="max-w-3xl w-full mx-auto">
+      <RemoteModelSettings />
+    </div>
+  ) : (
+    <LocalModelsSettings />
+  );
+};
+
+const LocalModelsSettings: React.FC = () => {
   const { t } = useTranslation();
   const [switchingModelId, setSwitchingModelId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");

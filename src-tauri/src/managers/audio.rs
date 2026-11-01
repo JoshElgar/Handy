@@ -360,9 +360,32 @@ pub struct RecordingReadiness {
     generation: u64,
 }
 
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+
+    #[test]
+    fn microphone_readiness_timeout_and_success() {
+        let (sender, receiver) = mpsc::channel();
+        let readiness = RecordingReadiness {
+            receiver,
+            generation: 1,
+        };
+        assert!(!readiness.wait_timeout(Duration::from_millis(10)));
+        drop(sender);
+        let (sender, receiver) = mpsc::channel();
+        sender.send(()).unwrap();
+        let readiness = RecordingReadiness {
+            receiver,
+            generation: 2,
+        };
+        assert!(readiness.wait_timeout(Duration::from_millis(10)));
+    }
+}
+
 impl RecordingReadiness {
-    pub fn wait(self) -> bool {
-        self.receiver.recv().is_ok()
+    pub fn wait_timeout(self, timeout: Duration) -> bool {
+        self.receiver.recv_timeout(timeout).is_ok()
     }
 
     pub fn generation(&self) -> u64 {
@@ -710,6 +733,9 @@ impl AudioRecordingManager {
         let mut recorder_opt = self.recorder.lock().unwrap();
         if let Some(rec) = recorder_opt.as_mut() {
             if let Err(first_err) = rec.open(resolution.device.clone()) {
+                if rec.worker_handle_pending() {
+                    return Err(anyhow::anyhow!("{first_err}"));
+                }
                 // A cached device or config may have gone stale (unplugged,
                 // rate/format changed). Re-resolve from a fresh enumeration and
                 // retry once before surfacing the error.

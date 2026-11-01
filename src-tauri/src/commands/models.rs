@@ -7,6 +7,36 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 #[tauri::command]
 #[specta::specta]
+pub async fn get_remote_models(
+    app: AppHandle,
+) -> Result<Vec<crate::remote_transcription::RemoteModelInfo>, String> {
+    let mut settings = get_settings(&app);
+    settings.remote_transcription_model = None;
+    let config = crate::remote_transcription::RemoteTranscriptionConfig::from_settings(&settings)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "Remote transcription is not configured".to_string())?;
+    crate::remote_transcription::list_models(&config)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn set_remote_model(app: AppHandle, model_id: String) -> Result<(), String> {
+    let models = get_remote_models(app.clone()).await?;
+    if !models.iter().any(|model| model.id == model_id) {
+        return Err("Model is not available on the remote server".into());
+    }
+    let mut settings = get_settings(&app);
+    settings.remote_transcription_model = Some(model_id);
+    crate::remote_transcription::RemoteTranscriptionConfig::from_settings(&settings)
+        .map_err(|error| error.to_string())?;
+    write_settings(&app, settings);
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
 pub async fn get_available_models(
     model_manager: State<'_, Arc<ModelManager>>,
 ) -> Result<Vec<ModelInfo>, String> {

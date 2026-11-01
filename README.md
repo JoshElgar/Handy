@@ -1,5 +1,29 @@
 # Handy
 
+## Handy Remote recovery
+
+This fork streams audio to the configured remote server and requires an internet
+connection. It does not automatically switch to a local model when disconnected.
+
+- Microphone initialization and first-sample waits fail after 5 seconds rather
+  than leaving the recording indicator gray indefinitely.
+- Connection establishment retries at most three times within 20 seconds, before
+  any audio is submitted. An established session is not silently replayed.
+- A stalled stream fails after 35 seconds without inbound traffic. Server
+  progress messages cannot extend absolute deadlines. Explicitly selected remote
+  models allow up to ten minutes for first-use loading and final transcription;
+  existing default streaming requests retain their 90-second final deadline.
+- General and Models settings offer the server’s full Handy catalogue, with
+  model files downloaded and verified on first use. Only one model stays loaded.
+  Models without streaming return text after recording stops.
+- Failed recordings with captured audio remain in History for retry after the
+  connection returns. No-sample microphone failures have no audio to recover.
+- macOS updates should be signed with the same Developer ID identity. Ad-hoc
+  builds change identity with every rebuild and can invalidate existing
+  Microphone and Accessibility approvals. Switching from an ad-hoc build requires
+  renewing those approvals in System Settings; do not reset privacy settings
+  automatically.
+
 [![Discord](https://img.shields.io/badge/Discord-%235865F2.svg?style=for-the-badge&logo=discord&logoColor=white)](https://discord.com/invite/WVBeWsNXK4)
 
 **A free, open source, and extensible speech-to-text application that works completely offline.**

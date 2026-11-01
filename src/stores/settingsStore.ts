@@ -82,6 +82,13 @@ const DEFAULT_AUDIO_DEVICE: AudioDevice = {
 const settingUpdaters: {
   [K in keyof Settings]?: (value: Settings[K]) => Promise<unknown>;
 } = {
+  remote_transcription_model: async (value) => {
+    const result = await commands.setRemoteModel(value as string);
+    if (result.status === "error") {
+      toast.error(result.error);
+      throw new Error(result.error);
+    }
+  },
   always_on_microphone: (value) =>
     commands.updateMicrophoneMode(value as boolean),
   audio_feedback: (value) =>

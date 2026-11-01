@@ -454,6 +454,9 @@ pub struct AppSettings {
     /// Optional HTTPS base URL for a self-hosted remote ASR service.
     #[serde(default)]
     pub remote_transcription_url: Option<String>,
+    /// Server catalogue model slug; None keeps the server's default model.
+    #[serde(default)]
+    pub remote_transcription_model: Option<String>,
     /// API credentials for remote ASR (kept redacted in Debug output).
     #[serde(default)]
     pub remote_transcription_api_keys: SecretMap,
@@ -952,6 +955,7 @@ pub fn get_default_settings() -> AppSettings {
         post_process_providers: default_post_process_providers(),
         post_process_api_keys: default_post_process_api_keys(),
         remote_transcription_url: None,
+        remote_transcription_model: None,
         remote_transcription_api_keys: SecretMap(HashMap::new()),
         post_process_models: default_post_process_models(),
         post_process_prompts: default_post_process_prompts(),

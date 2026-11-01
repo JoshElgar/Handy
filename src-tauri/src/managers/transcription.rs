@@ -109,6 +109,51 @@ enum StreamCmd {
 
 type RemoteStreamResult = Result<Option<String>, String>;
 type RemoteStreamResultReceiver = mpsc::Receiver<RemoteStreamResult>;
+
+fn receive_remote_result(
+    result_rx: RemoteStreamResultReceiver,
+    timeout: Duration,
+) -> Result<String> {
+    result_rx
+        .recv_timeout(timeout)
+        .map_err(|error| match error {
+            mpsc::RecvTimeoutError::Timeout => anyhow::anyhow!(
+                "Remote transcription timed out; your audio is saved in History for retry"
+            ),
+            mpsc::RecvTimeoutError::Disconnected => {
+                anyhow::anyhow!("Remote transcription stream exited without a result")
+            }
+        })?
+        .map_err(|error| anyhow::anyhow!(error))?
+        .ok_or_else(|| anyhow::anyhow!("Remote transcription stream was cancelled"))
+}
+
+#[cfg(test)]
+mod remote_result_tests {
+    use super::*;
+
+    #[test]
+    fn remote_result_wait_is_bounded_and_preserves_errors() {
+        let (sender, receiver) = mpsc::channel();
+        assert!(receive_remote_result(receiver, Duration::from_millis(10))
+            .unwrap_err()
+            .to_string()
+            .contains("timed out"));
+        drop(sender);
+        let (sender, receiver) = mpsc::channel();
+        sender.send(Err("connection lost".into())).unwrap();
+        assert!(receive_remote_result(receiver, Duration::from_millis(10))
+            .unwrap_err()
+            .to_string()
+            .contains("connection lost"));
+        let (sender, receiver) = mpsc::channel();
+        sender.send(Ok(Some("recovered".into()))).unwrap();
+        assert_eq!(
+            receive_remote_result(receiver, Duration::from_millis(10)).unwrap(),
+            "recovered"
+        );
+    }
+}
 type RemoteStreamFinish = (
     tokio::sync::mpsc::UnboundedSender<RemoteCommand>,
     RemoteStreamResultReceiver,
@@ -962,7 +1007,7 @@ impl TranscriptionManager {
                                 .emit(&app_handle);
                             },
                         ))
-                        .map_err(|error| error.to_string())
+                        .map_err(|error| format!("{error:#}"))
                     }
                     Err(error) => Err(error),
                 };
@@ -1260,6 +1305,7 @@ impl TranscriptionManager {
     /// should surface it instead of immediately starting a batch fallback.
     pub fn finalize_stream(&self) -> Result<Option<String>> {
         if self.router.is_remote() {
+            let config = self.router.remote_config.lock().unwrap().clone();
             let Some((tx, result_rx)) = self.router.finish_remote() else {
                 let failure = self.router.remote_failure();
                 self.router.clear_remote();
@@ -1268,28 +1314,32 @@ impl TranscriptionManager {
                 })));
             };
             let _ = tx.send(RemoteCommand::Finish);
-            let mut result = result_rx
-                .recv()
-                .map_err(|_| anyhow::anyhow!("Remote transcription stream exited without a result"))
-                .and_then(|result| result.map_err(|error| anyhow::anyhow!(error)))
-                .and_then(|text| {
-                    text.ok_or_else(|| anyhow::anyhow!("Remote transcription stream was cancelled"))
-                });
+            let mut result = receive_remote_result(
+                result_rx,
+                crate::remote_transcription::MODEL_OPERATION_TIMEOUT,
+            );
             if result.is_err() {
                 if let Some(failure) = self.router.remote_failure() {
                     result = Err(anyhow::anyhow!(failure));
                 }
             }
-            self.router.clear_remote();
+            if result.is_err() {
+                self.cancel_stream();
+            } else {
+                self.router.clear_remote();
+            }
             let text = result?;
             let settings = get_settings(&self.app_handle);
-            let evidence = OutputLanguageEvidence::ModelConstrained("en".to_string());
+            let evidence = config
+                .as_ref()
+                .map(|config| config.output_language())
+                .unwrap_or(OutputLanguageEvidence::Unknown);
+            let languages = config
+                .as_ref()
+                .map(|config| config.supported_languages())
+                .unwrap_or_default();
             return Ok(Some(post_process_transcription_text(
-                text,
-                &settings,
-                false,
-                &evidence,
-                &["en".to_string()],
+                text, &settings, false, &evidence, &languages,
             )));
         }
         let Some(tx) = self.router.take() else {
@@ -1383,6 +1433,8 @@ impl TranscriptionManager {
         let remote_settings = get_settings(&self.app_handle);
         match RemoteTranscriptionConfig::from_settings(&remote_settings) {
             Ok(Some(config)) => {
+                let evidence = config.output_language();
+                let languages = config.supported_languages();
                 let remote_audio = audio;
                 let text = thread::spawn(move || {
                     tauri::async_runtime::block_on(crate::remote_transcription::transcribe(
@@ -1392,13 +1444,12 @@ impl TranscriptionManager {
                 })
                 .join()
                 .map_err(|_| anyhow::anyhow!("Remote transcription task panicked"))??;
-                let evidence = OutputLanguageEvidence::ModelConstrained("en".to_string());
                 return Ok(post_process_transcription_text(
                     text,
                     &remote_settings,
                     false,
                     &evidence,
-                    &["en".to_string()],
+                    &languages,
                 ));
             }
             Err(error) => return Err(error),

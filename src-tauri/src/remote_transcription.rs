@@ -12,13 +12,18 @@ use tokio_tungstenite::{
 };
 
 const MAX_AUDIO_FRAME_BYTES: usize = 64 * 1024;
-const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(35);
+const STREAM_FINAL_TIMEOUT: Duration = Duration::from_secs(90);
+pub(crate) const MODEL_OPERATION_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Clone)]
 pub(crate) struct RemoteTranscriptionConfig {
     stream_url: String,
     transcribe_url: String,
     token: String,
+    model: Option<String>,
+    language: String,
+    supported_languages: Vec<String>,
 }
 
 impl RemoteTranscriptionConfig {
@@ -35,7 +40,23 @@ impl RemoteTranscriptionConfig {
             .get("default")
             .map(String::as_str)
             .unwrap_or_default();
-        Self::from_url(base_url, token).map(Some)
+        let mut config = Self::from_url(base_url, token)?;
+        config.model = settings.remote_transcription_model.clone();
+        let slug = config
+            .model
+            .as_deref()
+            .unwrap_or("parakeet-unified-en-0.6b");
+        let repo = format!("handy-computer/{slug}-gguf");
+        let descriptor = crate::catalog::CATALOG.iter().find(|model| {
+            matches!(&model.source, crate::managers::model::ModelSource::HuggingFace { repo_id, .. } if repo_id == &repo)
+        }).ok_or_else(|| anyhow!("Unknown remote transcription model: {slug}"))?;
+        config.supported_languages = descriptor.caps.languages.clone().unwrap_or_default();
+        config.language = crate::managers::model::effective_language(
+            &settings.selected_language,
+            &config.supported_languages,
+            descriptor.caps.supports_language_detect.unwrap_or(false),
+        );
+        Ok(Some(config))
     }
 
     fn from_url(base_url: &str, token: &str) -> Result<Self> {
@@ -63,12 +84,79 @@ impl RemoteTranscriptionConfig {
             stream_url,
             transcribe_url: url.to_string(),
             token: token.to_string(),
+            model: None,
+            language: "auto".into(),
+            supported_languages: vec!["en".into()],
         })
     }
 
     fn bearer(&self) -> String {
         format!("Bearer {}", self.token)
     }
+
+    fn start_message(&self) -> serde_json::Value {
+        let mut message = json!({"type":"start","sample_rate":16000,"format":"f32le"});
+        if let Some(model) = &self.model {
+            message["model"] = json!(model);
+            message["language"] = json!(self.language);
+        }
+        message
+    }
+
+    fn transcribe_request_url(&self) -> reqwest::Url {
+        let mut url = reqwest::Url::parse(&self.transcribe_url).expect("validated URL");
+        if let Some(model) = &self.model {
+            url.query_pairs_mut()
+                .append_pair("model", model)
+                .append_pair("language", &self.language);
+        }
+        url
+    }
+
+    pub(crate) fn supported_languages(&self) -> Vec<String> {
+        self.supported_languages.clone()
+    }
+
+    pub(crate) fn output_language(&self) -> crate::audio_toolkit::OutputLanguageEvidence {
+        use crate::audio_toolkit::OutputLanguageEvidence;
+        // Some multilingual models ignore language hints. Let the existing
+        // text-language detection resolve their output instead of assuming it.
+        if self.supported_languages.len() == 1 {
+            OutputLanguageEvidence::ModelConstrained(self.supported_languages[0].clone())
+        } else {
+            OutputLanguageEvidence::Unknown
+        }
+    }
+}
+
+#[derive(Clone, serde::Serialize, Deserialize, specta::Type)]
+pub struct RemoteModelInfo {
+    pub id: String,
+    pub name: String,
+    pub languages: Vec<String>,
+    pub supports_streaming: bool,
+    pub supports_language_detection: bool,
+    pub size_bytes: u64,
+}
+
+pub(crate) async fn list_models(
+    config: &RemoteTranscriptionConfig,
+) -> Result<Vec<RemoteModelInfo>> {
+    let mut url = reqwest::Url::parse(&config.transcribe_url)?;
+    let base = url.path().trim_end_matches("/transcribe").to_owned();
+    url.set_path(&format!("{base}/models"));
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?
+        .get(url)
+        .header(reqwest::header::AUTHORIZATION, config.bearer())
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await
+        .context("Invalid remote model catalogue")
 }
 
 #[derive(Debug)]
@@ -113,15 +201,54 @@ pub(crate) async fn stream(
         tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
         tokio_tungstenite::tungstenite::http::HeaderValue::from_str(&config.bearer())?,
     );
-    let (socket, _) = tokio::select! {
-        biased;
-        _ = wait_for_cancel(&mut cancel) => return Ok(None),
-        result = tokio::time::timeout(Duration::from_secs(20), tokio_tungstenite::connect_async(request)) => {
-            result.context("Remote stream connection timed out")?
-                .context("Failed to connect to remote transcription stream")?
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut attempt = 0;
+    let socket = loop {
+        attempt += 1;
+        let result = tokio::select! {
+            biased;
+            _ = wait_for_cancel(&mut cancel) => return Ok(None),
+            result = tokio::time::timeout_at(deadline, tokio_tungstenite::connect_async(request.clone())) => {
+                result.context("Remote stream connection timed out")?
+            }
+        };
+        match result {
+            Ok((socket, _)) => break socket,
+            Err(error) => {
+                let retryable = match &error {
+                    tokio_tungstenite::tungstenite::Error::Io(_) => true,
+                    tokio_tungstenite::tungstenite::Error::Http(response) => {
+                        response.status().is_server_error() || response.status().as_u16() == 429
+                    }
+                    _ => false,
+                };
+                if !retryable || attempt >= 3 {
+                    return Err(error).context("Failed to connect to remote transcription stream");
+                }
+                log::warn!("Remote connection attempt {attempt} failed; retrying before sending audio: {error}");
+                tokio::select! {
+                    biased;
+                    _ = wait_for_cancel(&mut cancel) => return Ok(None),
+                    _ = tokio::time::sleep_until(deadline) => bail!("Remote stream connection timed out: {error}"),
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                }
+            }
         }
     };
-    run_stream(socket, commands, &mut emit, STREAM_IDLE_TIMEOUT, cancel).await
+    run_stream(
+        socket,
+        commands,
+        &mut emit,
+        STREAM_IDLE_TIMEOUT,
+        if config.model.is_some() {
+            MODEL_OPERATION_TIMEOUT
+        } else {
+            STREAM_FINAL_TIMEOUT
+        },
+        cancel,
+        config.start_message(),
+    )
+    .await
 }
 
 async fn wait_for_cancel(cancel: &mut watch::Receiver<bool>) {
@@ -151,23 +278,31 @@ async fn run_stream<S>(
     mut commands: mpsc::UnboundedReceiver<RemoteCommand>,
     emit: &mut impl FnMut(String, String),
     idle_timeout: Duration,
+    final_timeout: Duration,
     mut cancel: watch::Receiver<bool>,
+    start_message: serde_json::Value,
 ) -> Result<Option<String>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let mut socket = socket;
-    let start = Message::Text(
-        json!({"type":"start","sample_rate":16000,"format":"f32le"})
-            .to_string()
-            .into(),
-    );
-    tokio::time::timeout(Duration::from_secs(20), socket.send(start))
-        .await
-        .context("Timed out starting remote transcription stream")?
-        .context("Failed to start remote transcription stream")?;
+    let ready_timeout = if start_message.get("model").is_some() {
+        MODEL_OPERATION_TIMEOUT
+    } else {
+        idle_timeout
+    };
+    let start = Message::Text(start_message.to_string().into());
+    tokio::select! {
+        biased;
+        _ = wait_for_cancel(&mut cancel) => return Ok(None),
+        result = tokio::time::timeout(idle_timeout, socket.send(start)) => {
+            result.context("Timed out starting remote transcription stream")?
+                .context("Failed to start remote transcription stream")?;
+        }
+    }
 
     let mut last_inbound = tokio::time::Instant::now();
+    let ready_deadline = last_inbound + ready_timeout;
     loop {
         let inbound = tokio::select! {
             biased;
@@ -175,8 +310,8 @@ where
                 cancel_socket(&mut socket).await;
                 return Ok(None);
             }
-            result = tokio::time::timeout_at(last_inbound + idle_timeout, socket.next()) => {
-                result.context("Remote transcription stream made no progress before the inactivity deadline")?
+            result = tokio::time::timeout_at((last_inbound + idle_timeout).min(ready_deadline), socket.next()) => {
+                result.context("Remote transcription server did not become ready; check your connection and try again")?
             }
         };
         let Some(inbound) = inbound else {
@@ -201,16 +336,19 @@ where
             Message::Close(frame) => {
                 bail!("Remote transcription stream closed before ready: {frame:?}")
             }
-            Message::Ping(payload) => socket
-                .send(Message::Pong(payload))
-                .await
-                .context("Failed to answer remote ping")?,
+            Message::Ping(payload) => {
+                tokio::time::timeout_at(ready_deadline, socket.send(Message::Pong(payload)))
+                    .await
+                    .context("Remote connection stalled before the server became ready")?
+                    .context("Failed to answer remote ping")?
+            }
             Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {}
         }
     }
 
     let (mut writer, mut reader) = socket.split();
     let (pong_tx, mut pong_rx) = mpsc::unbounded_channel();
+    let (finished_tx, mut finished_rx) = watch::channel(None);
     let writer = async {
         let mut finished = false;
         loop {
@@ -221,7 +359,8 @@ where
                     return Ok::<(), anyhow::Error>(());
                 }
                 Some(payload) = pong_rx.recv() => {
-                    writer.send(Message::Pong(payload)).await
+                    tokio::time::timeout(idle_timeout, writer.send(Message::Pong(payload))).await
+                        .context("Remote connection stalled while answering ping")?
                         .context("Failed to answer remote ping")?;
                 }
                 command = commands.recv(), if !finished => {
@@ -235,14 +374,17 @@ where
                                         cancel_socket(&mut writer).await;
                                         return Ok(());
                                     }
-                                    result = writer.send(Message::Binary(bytes.into())) => {
-                                        result.context("Failed to send audio to remote transcription stream")?;
+                                    result = tokio::time::timeout(idle_timeout, writer.send(Message::Binary(bytes.into()))) => {
+                                        result.context("Remote connection stalled while sending audio")?
+                                            .context("Failed to send audio to remote transcription stream")?;
                                     }
                                 }
                             }
                         }
                         Some(RemoteCommand::Finish) => {
-                            writer.send(Message::Text(json!({"type":"finish"}).to_string().into())).await
+                            let _ = finished_tx.send(Some(tokio::time::Instant::now() + final_timeout));
+                            tokio::time::timeout(idle_timeout, writer.send(Message::Text(json!({"type":"finish"}).to_string().into()))).await
+                                .context("Remote connection stalled while finishing")?
                                 .context("Failed to finish remote transcription stream")?;
                             finished = true;
                         }
@@ -254,7 +396,15 @@ where
     };
     tokio::pin!(writer);
     loop {
+        let final_deadline = *finished_rx.borrow();
         tokio::select! {
+            _ = finished_rx.changed() => {},
+            _ = async {
+                match final_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => bail!("Remote transcription did not finish within the deadline; your audio is saved in History for retry"),
             result = &mut writer => {
                 result?;
                 return Ok(None);
@@ -306,12 +456,12 @@ pub(crate) async fn transcribe(
 
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(20))
-        .timeout(Duration::from_secs(6_000))
+        .timeout(MODEL_OPERATION_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("Failed to create remote transcription HTTP client")?;
     let response = client
-        .post(&config.transcribe_url)
+        .post(config.transcribe_request_url())
         .header(reqwest::header::AUTHORIZATION, config.bearer())
         .header(reqwest::header::CONTENT_TYPE, "audio/wav")
         .body(cursor.into_inner())
@@ -348,11 +498,230 @@ mod tests {
             stream_url,
             transcribe_url: String::new(),
             token: "test-secret".into(),
+            model: None,
+            language: "auto".into(),
+            supported_languages: vec!["en".into()],
         }
     }
     async fn listener() -> (SocketAddr, TcpListener) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         (listener.local_addr().unwrap(), listener)
+    }
+
+    #[test]
+    fn model_selection_and_language_are_snapshotted_in_request_config() {
+        let mut settings = crate::settings::get_default_settings();
+        settings.remote_transcription_url = Some("https://asr.example".into());
+        settings
+            .remote_transcription_api_keys
+            .insert("default".into(), "secret".into());
+        settings.remote_transcription_model = Some("moonshine-streaming-small".into());
+        settings.selected_language = "en".into();
+        let config = RemoteTranscriptionConfig::from_settings(&settings)
+            .unwrap()
+            .unwrap();
+        settings.remote_transcription_model = Some("whisper-medium".into());
+        assert_eq!(config.start_message()["model"], "moonshine-streaming-small");
+        assert_eq!(config.start_message()["language"], "en");
+        assert_eq!(config.supported_languages(), vec!["en".to_string()]);
+        assert_eq!(
+            config
+                .transcribe_request_url()
+                .query_pairs()
+                .find(|(k, _)| k == "model")
+                .unwrap()
+                .1,
+            "moonshine-streaming-small"
+        );
+    }
+
+    #[test]
+    fn multilingual_selection_does_not_assume_english_output() {
+        let mut settings = crate::settings::get_default_settings();
+        settings.remote_transcription_url = Some("https://asr.example".into());
+        settings
+            .remote_transcription_api_keys
+            .insert("default".into(), "secret".into());
+        settings.remote_transcription_model = Some("whisper-medium".into());
+        let config = RemoteTranscriptionConfig::from_settings(&settings)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            config.output_language(),
+            crate::audio_toolkit::text::OutputLanguageEvidence::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_connection_retries_gateway_failure_without_losing_audio() {
+        let (address, listener) = listener().await;
+        let server = tokio::spawn(async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut request = [0; 2048];
+            tcp.read(&mut request).await.unwrap();
+            tcp.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            drop(tcp);
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(tcp).await.unwrap();
+            assert!(socket
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap()
+                .contains("start"));
+            socket
+                .send(Message::Text(json!({"type":"ready"}).to_string().into()))
+                .await
+                .unwrap();
+            assert_eq!(
+                socket.next().await.unwrap().unwrap().into_data().as_ref(),
+                0.25_f32.to_le_bytes()
+            );
+            assert!(socket
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap()
+                .contains("finish"));
+            socket
+                .send(Message::Text(
+                    json!({"type":"final","text":"recovered"})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+        });
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(RemoteCommand::Audio(vec![0.25])).unwrap();
+        tx.send(RemoteCommand::Finish).unwrap();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            stream(
+                &config_for_test(format!("ws://{address}/stream")),
+                rx,
+                cancel_rx,
+                |_, _| {},
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.as_deref(), Some("recovered"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_connection_auth_failure_is_not_retried() {
+        let (address, listener) = listener().await;
+        let server = tokio::spawn(async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut request = [0; 2048];
+            tcp.read(&mut request).await.unwrap();
+            tcp.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            drop(tcp);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(750), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let error = stream(
+            &config_for_test(format!("ws://{address}/stream")),
+            rx,
+            cancel_rx,
+            |_, _| {},
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("401"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_connection_cancel_interrupts_retry_delay() {
+        let (address, listener) = listener().await;
+        let (failed_tx, failed_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut request = [0; 2048];
+            tcp.read(&mut request).await.unwrap();
+            tcp.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            drop(tcp);
+            failed_tx.send(()).unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(750), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let config = config_for_test(format!("ws://{address}/stream"));
+        let client = tokio::spawn(async move { stream(&config, rx, cancel_rx, |_, _| {}).await });
+        failed_rx.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel_tx.send(true).unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(250), client)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .is_none());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_connection_stops_after_three_gateway_failures() {
+        let (address, listener) = listener().await;
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            for _attempt in 0..3 {
+                let (mut tcp, _) = listener.accept().await.unwrap();
+                let mut request = [0; 2048];
+                tcp.read(&mut request).await.unwrap();
+                tcp.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(750), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let error = tokio::time::timeout(
+            Duration::from_secs(3),
+            stream(
+                &config_for_test(format!("ws://{address}/stream")),
+                rx,
+                cancel_rx,
+                |_, _| {},
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("503"));
+        server.await.unwrap();
     }
 
     #[test]
@@ -365,6 +734,159 @@ mod tests {
         assert!(RemoteTranscriptionConfig::from_url("https://u:p@asr.example", "secret").is_err());
         assert!(RemoteTranscriptionConfig::from_url("https://asr.example?x=1", "secret").is_err());
         assert!(RemoteTranscriptionConfig::from_url("https://asr.example", "  ").is_err());
+    }
+
+    #[tokio::test]
+    async fn remote_recovery_blackholed_stream_times_out_and_next_session_succeeds() {
+        let (address, listener) = listener().await;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut stalled = accept_async(tcp).await.unwrap();
+            stalled.next().await.unwrap().unwrap();
+            stalled
+                .send(Message::Text(json!({"type":"ready"}).to_string().into()))
+                .await
+                .unwrap();
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut recovered = accept_async(tcp).await.unwrap();
+            recovered.next().await.unwrap().unwrap();
+            recovered
+                .send(Message::Text(json!({"type":"ready"}).to_string().into()))
+                .await
+                .unwrap();
+            recovered.next().await.unwrap().unwrap();
+            recovered
+                .send(Message::Text(
+                    json!({"type":"final","text":"recovered"})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+        });
+        for succeeds in [false, true] {
+            let tcp = TcpStream::connect(address).await.unwrap();
+            let socket = tokio_tungstenite::client_async(format!("ws://{address}/stream"), tcp)
+                .await
+                .unwrap()
+                .0;
+            let (tx, rx) = mpsc::unbounded_channel();
+            tx.send(RemoteCommand::Finish).unwrap();
+            let (_cancel_tx, cancel_rx) = watch::channel(false);
+            let result = run_stream(
+                socket,
+                rx,
+                &mut |_, _| {},
+                Duration::from_millis(100),
+                Duration::from_secs(1),
+                cancel_rx,
+                json!({"type":"start","sample_rate":16000,"format":"f32le"}),
+            )
+            .await;
+            if succeeds {
+                assert_eq!(result.unwrap().as_deref(), Some("recovered"));
+            } else {
+                assert!(format!("{:#}", result.unwrap_err()).contains("inactivity"));
+            }
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_recovery_progress_cannot_keep_unready_session_alive_forever() {
+        let (address, listener) = listener().await;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(tcp).await.unwrap();
+            ws.next().await.unwrap().unwrap();
+            for _ in 0..20 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                if ws
+                    .send(Message::Text(json!({"type":"progress"}).to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let tcp = TcpStream::connect(address).await.unwrap();
+        let socket = tokio_tungstenite::client_async(format!("ws://{address}/stream"), tcp)
+            .await
+            .unwrap()
+            .0;
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let result = tokio::time::timeout(
+            Duration::from_millis(150),
+            run_stream(
+                socket,
+                rx,
+                &mut |_, _| {},
+                Duration::from_millis(50),
+                Duration::from_secs(1),
+                cancel_rx,
+                json!({"type":"start","sample_rate":16000,"format":"f32le"}),
+            ),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "progress must not extend the ready deadline"
+        );
+        assert!(result.unwrap().is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_recovery_progress_cannot_keep_final_loading_forever() {
+        let (address, listener) = listener().await;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(tcp).await.unwrap();
+            ws.next().await.unwrap().unwrap();
+            ws.send(Message::Text(json!({"type":"ready"}).to_string().into()))
+                .await
+                .unwrap();
+            ws.next().await.unwrap().unwrap();
+            for _ in 0..20 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                if ws
+                    .send(Message::Text(json!({"type":"progress"}).to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let tcp = TcpStream::connect(address).await.unwrap();
+        let socket = tokio_tungstenite::client_async(format!("ws://{address}/stream"), tcp)
+            .await
+            .unwrap()
+            .0;
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(RemoteCommand::Finish).unwrap();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let result = tokio::time::timeout(
+            Duration::from_millis(150),
+            run_stream(
+                socket,
+                rx,
+                &mut |_, _| {},
+                Duration::from_millis(100),
+                Duration::from_millis(50),
+                cancel_rx,
+                json!({"type":"start","sample_rate":16000,"format":"f32le"}),
+            ),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "progress must not extend the final deadline"
+        );
+        assert!(result.unwrap().is_err());
+        server.abort();
     }
 
     #[tokio::test]
@@ -476,7 +998,15 @@ mod tests {
             .0;
         let result = tokio::time::timeout(
             Duration::from_millis(250),
-            run_stream(socket, rx, &mut noop, Duration::from_millis(75), cancel_rx),
+            run_stream(
+                socket,
+                rx,
+                &mut noop,
+                Duration::from_millis(75),
+                Duration::from_secs(1),
+                cancel_rx,
+                json!({"type":"start","sample_rate":16000,"format":"f32le"}),
+            ),
         )
         .await
         .unwrap()

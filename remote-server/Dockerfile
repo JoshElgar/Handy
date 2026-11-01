@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    MODEL_PATH=/app/models/parakeet-unified-en-0.6b-Q8_0.gguf \
+    MODEL_CACHE_DIR=/app/models \
     TRANSCRIBE_LIBRARY=/opt/transcribe/lib/libtranscribe.so \
     PYTHONPATH=/opt/transcribe.cpp/bindings/python/src \
     PORT=10000
@@ -36,15 +36,14 @@ RUN git init \
 RUN python -m pip install --no-cache-dir \
       'fastapi==0.115.12' 'uvicorn[standard]==0.34.0' 'httpx==0.28.1' \
     && python -c 'import transcribe_cpp; assert transcribe_cpp.backend_available("cpu"), transcribe_cpp.backends()' \
-    && mkdir -p /app/models \
-    && curl -fL --retry 3 \
-      'https://huggingface.co/handy-computer/parakeet-unified-en-0.6b-gguf/resolve/main/parakeet-unified-en-0.6b-Q8_0.gguf' \
-      -o /app/models/parakeet-unified-en-0.6b-Q8_0.gguf
+    && mkdir -p /app/models
 
 WORKDIR /app
-COPY server.py model_worker.py test_server.py ./
+COPY remote-server/server.py remote-server/model_worker.py remote-server/models.py remote-server/test_server.py remote-server/test_models.py ./
+COPY src-tauri/src/catalog/catalog.json ./catalog.json
 RUN API_TOKEN=test-secret python -c 'import transcribe_cpp; assert transcribe_cpp.backend_available("cpu"), transcribe_cpp.backends()' \
-    && python -m unittest -v test_server
+    && python -m unittest -v test_server test_models \
+    && python -c 'from models import ModelRegistry; ModelRegistry().ensure_file(None)'
 
 EXPOSE 10000
 CMD ["python", "server.py"]

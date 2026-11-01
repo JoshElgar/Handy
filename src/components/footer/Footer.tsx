@@ -3,8 +3,12 @@ import { getVersion } from "@tauri-apps/api/app";
 
 import ModelSelector from "../model-selector";
 import UpdateChecker from "../update-checker";
+import { useSettings } from "@/hooks/useSettings";
+import { useTranslation } from "react-i18next";
 
 const Footer: React.FC = () => {
+  const { getSetting } = useSettings();
+  const { t } = useTranslation();
   const [version, setVersion] = useState("");
 
   useEffect(() => {
@@ -25,7 +29,11 @@ const Footer: React.FC = () => {
     <div className="w-full border-t border-mid-gray/20 pt-3">
       <div className="flex justify-between items-center text-xs px-4 pb-3 text-text/60">
         <div className="flex items-center gap-4">
-          <ModelSelector />
+          {getSetting("remote_transcription_url")?.trim() ? (
+            <span>{t("settings.remote.title")}</span>
+          ) : (
+            <ModelSelector />
+          )}
         </div>
 
         {/* Update Status */}

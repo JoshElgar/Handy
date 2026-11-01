@@ -171,6 +171,9 @@ impl AudioRecorder {
 
     pub fn open(&mut self, device: Option<Device>) -> Result<(), Box<dyn std::error::Error>> {
         if self.worker_handle.is_some() {
+            if self.worker_handle_pending() {
+                return Err(Box::new(Error::other("Microphone initialization is still pending; try again after the device recovers")));
+            }
             if !self.needs_reopen() {
                 return Ok(()); // already open
             }
@@ -317,7 +320,9 @@ impl AudioRecorder {
 
             match init_result {
                 Ok((stream, sample_rate, sample_consumer)) => {
-                    let _ = init_tx.send(Ok(()));
+                    if init_tx.send(Ok(())).is_err() {
+                        return;
+                    }
                     // Timestamp for the play()-returned -> first-samples gap the
                     // init handshake can't see (hardware dependent).
                     let stream_running_at = Instant::now();
@@ -348,10 +353,20 @@ impl AudioRecorder {
             }
         });
 
-        match init_rx.recv() {
+        self.wait_for_initialization(init_rx, worker, Duration::from_secs(5))?;
+        self.device = Some(device);
+        self.cmd_tx = Some(cmd_tx);
+        Ok(())
+    }
+
+    fn wait_for_initialization(
+        &mut self,
+        init_rx: mpsc::Receiver<Result<(), String>>,
+        worker: std::thread::JoinHandle<()>,
+        timeout: Duration,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        match init_rx.recv_timeout(timeout) {
             Ok(Ok(())) => {
-                self.device = Some(device);
-                self.cmd_tx = Some(cmd_tx);
                 self.worker_handle = Some(worker);
                 Ok(())
             }
@@ -363,6 +378,11 @@ impl AudioRecorder {
                     std::io::ErrorKind::Other
                 };
                 Err(Box::new(Error::new(kind, error_message)))
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.worker_handle = Some(worker);
+                Err(Box::new(Error::new(std::io::ErrorKind::TimedOut,
+                    "Microphone did not initialize within 5 seconds; check your input device and try again")))
             }
             Err(recv_error) => {
                 let _ = worker.join();
@@ -412,7 +432,20 @@ impl AudioRecorder {
                 .is_some_and(|handle| handle.is_finished())
     }
 
+    pub fn worker_handle_pending(&self) -> bool {
+        self.cmd_tx.is_none()
+            && self
+                .worker_handle
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+    }
+
     pub fn close(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.worker_handle_pending() {
+            return Err(Box::new(Error::other(
+                "Microphone initialization is still pending",
+            )));
+        }
         if let Some(tx) = self.cmd_tx.take() {
             let _ = tx.send(Cmd::Shutdown);
         }

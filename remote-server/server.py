@@ -15,10 +15,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
+from models import ModelRegistry
 
-MODEL_PATH = os.environ.get(
-    "MODEL_PATH", "/app/models/parakeet-unified-en-0.6b-Q8_0.gguf"
-)
 MAX_FRAME_BYTES = 64 * 1024
 MAX_WAV_BYTES = 128 * 1024 * 1024
 PROGRESS_INTERVAL = 10
@@ -75,6 +73,7 @@ def create_app(*, token=None, worker_command=None):
         str(Path(__file__).with_name("model_worker.py")),
     ]
     state = {"worker": None, "active": None}
+    registry = ModelRegistry()
     lock = asyncio.Lock()
 
     async def kill_worker():
@@ -119,7 +118,6 @@ def create_app(*, token=None, worker_command=None):
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     limit=4 * 1024 * 1024,
-                    env={**os.environ, "MODEL_PATH": MODEL_PATH},
                 )
             )
             try:
@@ -147,7 +145,10 @@ def create_app(*, token=None, worker_command=None):
             command["type"],
             time.monotonic() - started,
         )
-        return json.loads(line)
+        reply = json.loads(line)
+        if reply.get("type") == "error":
+            raise RuntimeError(reply.get("message", "Model operation failed"))
+        return reply
 
     @asynccontextmanager
     async def lifespan(_app):
@@ -162,6 +163,12 @@ def create_app(*, token=None, worker_command=None):
     async def health():
         return {"status": "ok"}
 
+    @app.get("/models")
+    async def models(request: Request):
+        if not hmac.compare_digest(request.headers.get("authorization", ""), f"Bearer {token}"):
+            raise HTTPException(status_code=401, detail="unauthorized")
+        return registry.list()
+
     @app.post("/transcribe")
     async def transcribe(request: Request):
         if not hmac.compare_digest(
@@ -175,6 +182,12 @@ def create_app(*, token=None, worker_command=None):
             raise HTTPException(
                 status_code=415, detail="Content-Type must be audio/wav"
             )
+        model_id = request.query_params.get("model")
+        language = request.query_params.get("language", "auto")
+        try:
+            model = registry.get(model_id)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from None
         with tempfile.SpooledTemporaryFile(max_size=1024 * 1024) as upload:
             total = 0
             async for part in request.stream():
@@ -205,7 +218,7 @@ def create_app(*, token=None, worker_command=None):
                 owner = await claim()
                 completed = False
                 try:
-                    await call(owner, {"type": "start"})
+                    await call(owner, {"type": "start", "model": model["slug"], "language": language})
                     remaining = frames
                     while remaining:
                         count = min(16000, remaining)
@@ -232,7 +245,7 @@ def create_app(*, token=None, worker_command=None):
                     result = await call(owner, {"type": "finish"})
                     completed = True
                     await release(owner, True)
-                    return {"text": result["text"]}
+                    return {"text": result["text"], "language": result.get("language")}
                 except asyncio.CancelledError:
                     if not owner["replaced"]:
                         raise
@@ -241,10 +254,10 @@ def create_app(*, token=None, worker_command=None):
                     )
                 except HTTPException:
                     raise
-                except Exception:
+                except Exception as error:
                     LOG.exception("history transcription failed")
                     return JSONResponse(
-                        {"error": "transcription failed"}, status_code=500
+                        {"error": str(error)}, status_code=500
                     )
                 finally:
                     await release(owner, completed)
@@ -309,13 +322,21 @@ def create_app(*, token=None, worker_command=None):
             if start == {"type": "cancel"}:
                 await send({"type": "cancelled"})
                 return
-            if start != {"type": "start", "sample_rate": 16000, "format": "f32le"}:
+            if (not isinstance(start, dict) or start.get("type") != "start"
+                or start.get("sample_rate") != 16000 or start.get("format") != "f32le"
+                or set(start) - {"type", "sample_rate", "format", "model", "language"}
+                or not isinstance(start.get("language", "auto"), str)):
                 await send({"type": "error", "message": "invalid start message"})
+                return
+            try:
+                model = registry.get(start.get("model"))
+            except ValueError as error:
+                await send({"type": "error", "message": str(error)})
                 return
             owner = await claim()
             receiver = asyncio.create_task(receive())
             heartbeat = asyncio.create_task(_progress(websocket, stop))
-            await send(await call(owner, {"type": "start"}))
+            await send(await call(owner, {"type": "start", "model": model["slug"], "language": start.get("language", "auto")}))
             while True:
                 message = await incoming.get()
                 audio = message.get("bytes")
@@ -361,10 +382,10 @@ def create_app(*, token=None, worker_command=None):
                 pass
         except WebSocketDisconnect:
             pass
-        except Exception:
+        except Exception as error:
             LOG.exception("stream transcription failed")
             try:
-                await send({"type": "error", "message": "transcription failed"})
+                await send({"type": "error", "message": str(error)})
             except Exception:
                 pass
         finally:
